@@ -1,5 +1,7 @@
 .env*
 !.env.example
+!.env.dev.example
+!.env.prod.example
 .venv/
 .venv-win/
 data/
