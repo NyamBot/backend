@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
-from app.routers import restaurants, users
+from app.routers import auth, restaurants, users
 from app.schemas import HealthResponse
 
 app = FastAPI(title=settings.app_name)
@@ -15,6 +15,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth.router)
 app.include_router(users.router)
 app.include_router(restaurants.router)
 

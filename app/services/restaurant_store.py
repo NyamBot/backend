@@ -150,6 +150,32 @@ class SqliteRestaurantStore:
             raise RuntimeError("Created user could not be loaded")
         return user
 
+    def upsert_user(
+        self,
+        email: str,
+        display_name: str,
+        avatar_url: str | None,
+        auth_provider: str,
+        provider_subject: str,
+    ) -> dict[str, Any]:
+        existing = self.get_user_by_provider(auth_provider, provider_subject)
+        if existing is None:
+            return self.create_user(email, display_name, avatar_url, auth_provider, provider_subject)
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE users
+                SET email = ?, display_name = ?, avatar_url = ?, last_login_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (email, display_name, avatar_url, existing["id"]),
+            )
+        user = self.get_user(existing["id"])
+        if user is None:
+            raise RuntimeError("Updated user could not be loaded")
+        return user
+
     def list_users(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -172,6 +198,19 @@ class SqliteRestaurantStore:
                 WHERE id = ?
                 """,
                 (user_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_user_by_provider(self, auth_provider: str, provider_subject: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, email, display_name, avatar_url, auth_provider,
+                    provider_subject, created_at, last_login_at
+                FROM users
+                WHERE auth_provider = ? AND provider_subject = ?
+                """,
+                (auth_provider, provider_subject),
             ).fetchone()
         return dict(row) if row else None
 
@@ -627,6 +666,33 @@ class PgRestaurantStore(SqliteRestaurantStore):
             raise RuntimeError("Created user could not be loaded")
         return user
 
+    def upsert_user(
+        self,
+        email: str,
+        display_name: str,
+        avatar_url: str | None,
+        auth_provider: str,
+        provider_subject: str,
+    ) -> dict[str, Any]:
+        existing = self.get_user_by_provider(auth_provider, provider_subject)
+        if existing is None:
+            return self.create_user(email, display_name, avatar_url, auth_provider, provider_subject)
+
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE users
+                    SET email = %s, display_name = %s, avatar_url = %s, last_login_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (email, display_name, avatar_url, existing["id"]),
+                )
+        user = self.get_user(existing["id"])
+        if user is None:
+            raise RuntimeError("Updated user could not be loaded")
+        return user
+
     def list_users(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
             with connection.cursor(row_factory=self.dict_row) as cursor:
@@ -653,6 +719,21 @@ class PgRestaurantStore(SqliteRestaurantStore):
                     WHERE id = %s
                     """,
                     (user_id,),
+                )
+                return cursor.fetchone()
+
+    def get_user_by_provider(self, auth_provider: str, provider_subject: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            with connection.cursor(row_factory=self.dict_row) as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, email, display_name, avatar_url, auth_provider,
+                        provider_subject, created_at::text AS created_at,
+                        last_login_at::text AS last_login_at
+                    FROM users
+                    WHERE auth_provider = %s AND provider_subject = %s
+                    """,
+                    (auth_provider, provider_subject),
                 )
                 return cursor.fetchone()
 
@@ -808,11 +889,24 @@ class RestaurantStore:
     ) -> dict[str, Any]:
         return self.backend.create_user(email, display_name, avatar_url, auth_provider, provider_subject)
 
+    def upsert_user(
+        self,
+        email: str,
+        display_name: str,
+        avatar_url: str | None,
+        auth_provider: str,
+        provider_subject: str,
+    ) -> dict[str, Any]:
+        return self.backend.upsert_user(email, display_name, avatar_url, auth_provider, provider_subject)
+
     def list_users(self) -> list[dict[str, Any]]:
         return self.backend.list_users()
 
     def get_user(self, user_id: str) -> dict[str, Any] | None:
         return self.backend.get_user(user_id)
+
+    def get_user_by_provider(self, auth_provider: str, provider_subject: str) -> dict[str, Any] | None:
+        return self.backend.get_user_by_provider(auth_provider, provider_subject)
 
     def list_restaurants(self, user_id: str | None = None) -> list[RestaurantResponse]:
         return self.backend.list_restaurants(user_id)
