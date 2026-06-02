@@ -11,6 +11,7 @@ from uuid import uuid4
 from app.core.config import settings
 from app.schemas import (
     RestaurantCreate,
+    RestaurantNoteCreate,
     RestaurantRecommendation,
     RestaurantResponse,
     TasteAgentMessage,
@@ -108,8 +109,71 @@ class SqliteRestaurantStore:
 
                 CREATE INDEX IF NOT EXISTS idx_taste_agent_messages_user_id
                     ON taste_agent_messages(user_id);
+
+                CREATE TABLE IF NOT EXISTS users (
+                    id TEXT PRIMARY KEY,
+                    email TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    avatar_url TEXT,
+                    auth_provider TEXT NOT NULL DEFAULT 'demo',
+                    provider_subject TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    last_login_at TEXT
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_users_provider_subject
+                    ON users(auth_provider, provider_subject)
+                    WHERE provider_subject IS NOT NULL;
                 """
             )
+
+    def create_user(
+        self,
+        email: str,
+        display_name: str,
+        avatar_url: str | None,
+        auth_provider: str,
+        provider_subject: str | None,
+    ) -> dict[str, Any]:
+        user_id = str(uuid4())
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO users
+                    (id, email, display_name, avatar_url, auth_provider, provider_subject)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, email, display_name, avatar_url, auth_provider, provider_subject),
+            )
+        user = self.get_user(user_id)
+        if user is None:
+            raise RuntimeError("Created user could not be loaded")
+        return user
+
+    def list_users(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, email, display_name, avatar_url, auth_provider,
+                    provider_subject, created_at, last_login_at
+                FROM users
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_user(self, user_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, email, display_name, avatar_url, auth_provider,
+                    provider_subject, created_at, last_login_at
+                FROM users
+                WHERE id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+        return dict(row) if row else None
 
     def create_restaurant(self, payload: RestaurantCreate) -> RestaurantResponse:
         restaurant_id = str(uuid4())
@@ -159,6 +223,29 @@ class SqliteRestaurantStore:
         if restaurant is None:
             raise RuntimeError("Created restaurant could not be loaded")
         return restaurant
+
+    def add_note(self, restaurant_id: str, payload: RestaurantNoteCreate) -> RestaurantResponse | None:
+        restaurant = self.get_restaurant(restaurant_id)
+        if restaurant is None:
+            return None
+        note_id = str(uuid4())
+        note_tags = sorted(set(payload.tags + restaurant.mood_tags + [restaurant.area, restaurant.cuisine, restaurant.price_level]))
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO restaurant_notes
+                    (id, restaurant_id, content, tags_json, embedding_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    note_id,
+                    restaurant_id,
+                    payload.content,
+                    json.dumps(note_tags, ensure_ascii=False),
+                    json.dumps(_embed(payload.content), ensure_ascii=False),
+                ),
+            )
+        return self.get_restaurant(restaurant_id)
 
     def list_restaurants(self, user_id: str | None = None) -> list[RestaurantResponse]:
         where_clause = "WHERE restaurants.user_id = ?" if user_id else ""
@@ -410,6 +497,27 @@ class PgRestaurantStore(SqliteRestaurantStore):
                     """
                 )
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_taste_agent_messages_user_id ON taste_agent_messages(user_id)")
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS users (
+                        id TEXT PRIMARY KEY,
+                        email TEXT NOT NULL,
+                        display_name TEXT NOT NULL,
+                        avatar_url TEXT,
+                        auth_provider TEXT NOT NULL DEFAULT 'demo',
+                        provider_subject TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        last_login_at TIMESTAMPTZ
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_provider_subject
+                        ON users(auth_provider, provider_subject)
+                        WHERE provider_subject IS NOT NULL
+                    """
+                )
                 connection.commit()
                 try:
                     cursor.execute(
@@ -470,6 +578,83 @@ class PgRestaurantStore(SqliteRestaurantStore):
         if restaurant is None:
             raise RuntimeError("Created restaurant could not be loaded")
         return restaurant
+
+    def add_note(self, restaurant_id: str, payload: RestaurantNoteCreate) -> RestaurantResponse | None:
+        restaurant = self.get_restaurant(restaurant_id)
+        if restaurant is None:
+            return None
+        note_id = str(uuid4())
+        note_tags = sorted(set(payload.tags + restaurant.mood_tags + [restaurant.area, restaurant.cuisine, restaurant.price_level]))
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO restaurant_notes
+                        (id, restaurant_id, content, tags_json, embedding)
+                    VALUES (%s, %s, %s, %s, %s::vector)
+                    """,
+                    (
+                        note_id,
+                        restaurant_id,
+                        payload.content,
+                        json.dumps(note_tags, ensure_ascii=False),
+                        _embedding_to_pgvector(_embed(payload.content)),
+                    ),
+                )
+        return self.get_restaurant(restaurant_id)
+
+    def create_user(
+        self,
+        email: str,
+        display_name: str,
+        avatar_url: str | None,
+        auth_provider: str,
+        provider_subject: str | None,
+    ) -> dict[str, Any]:
+        user_id = str(uuid4())
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO users
+                        (id, email, display_name, avatar_url, auth_provider, provider_subject)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (user_id, email, display_name, avatar_url, auth_provider, provider_subject),
+                )
+        user = self.get_user(user_id)
+        if user is None:
+            raise RuntimeError("Created user could not be loaded")
+        return user
+
+    def list_users(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            with connection.cursor(row_factory=self.dict_row) as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, email, display_name, avatar_url, auth_provider,
+                        provider_subject, created_at::text AS created_at,
+                        last_login_at::text AS last_login_at
+                    FROM users
+                    ORDER BY created_at DESC
+                    """
+                )
+                return list(cursor.fetchall())
+
+    def get_user(self, user_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            with connection.cursor(row_factory=self.dict_row) as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, email, display_name, avatar_url, auth_provider,
+                        provider_subject, created_at::text AS created_at,
+                        last_login_at::text AS last_login_at
+                    FROM users
+                    WHERE id = %s
+                    """,
+                    (user_id,),
+                )
+                return cursor.fetchone()
 
     def list_restaurants(self, user_id: str | None = None) -> list[RestaurantResponse]:
         where_clause = "WHERE restaurants.user_id = %s" if user_id else ""
@@ -609,6 +794,25 @@ class RestaurantStore:
 
     def create_restaurant(self, payload: RestaurantCreate) -> RestaurantResponse:
         return self.backend.create_restaurant(payload)
+
+    def add_note(self, restaurant_id: str, payload: RestaurantNoteCreate) -> RestaurantResponse | None:
+        return self.backend.add_note(restaurant_id, payload)
+
+    def create_user(
+        self,
+        email: str,
+        display_name: str,
+        avatar_url: str | None,
+        auth_provider: str,
+        provider_subject: str | None,
+    ) -> dict[str, Any]:
+        return self.backend.create_user(email, display_name, avatar_url, auth_provider, provider_subject)
+
+    def list_users(self) -> list[dict[str, Any]]:
+        return self.backend.list_users()
+
+    def get_user(self, user_id: str) -> dict[str, Any] | None:
+        return self.backend.get_user(user_id)
 
     def list_restaurants(self, user_id: str | None = None) -> list[RestaurantResponse]:
         return self.backend.list_restaurants(user_id)
