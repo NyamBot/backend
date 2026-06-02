@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
-from app.routers import agent, clips, sources, users
+from app.routers import agent, clips, restaurants, sources, users
 from app.schemas import HealthResponse
 from app.services.vector_store import vector_store
 
@@ -20,6 +20,7 @@ app.include_router(sources.router)
 app.include_router(clips.router)
 app.include_router(agent.router)
 app.include_router(users.router)
+app.include_router(restaurants.router)
 
 
 @app.get("/health", response_model=HealthResponse)
