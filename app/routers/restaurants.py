@@ -4,11 +4,14 @@ from app.schemas import (
     RestaurantChatRequest,
     RestaurantChatResponse,
     RestaurantCreate,
+    RestaurantNoteCreate,
+    KakaoPlaceSearchResponse,
     RestaurantRecommendationRequest,
     RestaurantRecommendationsResponse,
     RestaurantResponse,
     TasteAgentMessagesResponse,
 )
+from app.services.kakao_local import search_places
 from app.services.restaurant_store import restaurant_store
 
 router = APIRouter(prefix="/api/restaurants", tags=["restaurants"])
@@ -24,9 +27,23 @@ def list_restaurants(user_id: str | None = None) -> list[RestaurantResponse]:
     return restaurant_store.list_restaurants(user_id=user_id)
 
 
+@router.get("/kakao/search", response_model=KakaoPlaceSearchResponse)
+def search_kakao_places(query: str, size: int = 5) -> KakaoPlaceSearchResponse:
+    places = search_places(query=query, size=min(max(size, 1), 15))
+    return KakaoPlaceSearchResponse(query=query, places=places)
+
+
 @router.get("/{restaurant_id}", response_model=RestaurantResponse)
 def get_restaurant(restaurant_id: str) -> RestaurantResponse:
     restaurant = restaurant_store.get_restaurant(restaurant_id)
+    if restaurant is None:
+        raise HTTPException(status_code=404, detail="Restaurant not found")
+    return restaurant
+
+
+@router.post("/{restaurant_id}/notes", response_model=RestaurantResponse)
+def add_restaurant_note(restaurant_id: str, payload: RestaurantNoteCreate) -> RestaurantResponse:
+    restaurant = restaurant_store.add_note(restaurant_id, payload)
     if restaurant is None:
         raise HTTPException(status_code=404, detail="Restaurant not found")
     return restaurant

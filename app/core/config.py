@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     frontend_url: str = "http://localhost:5173"
     kakao_client_id: str | None = None
     kakao_client_secret: str | None = None
+    kakao_local_rest_api_key: str | None = None
     kakao_redirect_uri: str = "http://localhost:8000/api/auth/kakao/callback"
     jwt_secret_key: str | None = None
 
