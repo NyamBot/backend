@@ -11,7 +11,7 @@ from app.schemas import (
     RestaurantResponse,
     TasteAgentMessagesResponse,
 )
-from app.services.kakao_local import search_places
+from app.services.kakao_local import KakaoLocalApiError, search_places
 from app.services.restaurant_store import restaurant_store
 
 router = APIRouter(prefix="/api/restaurants", tags=["restaurants"])
@@ -29,7 +29,10 @@ def list_restaurants(user_id: str | None = None) -> list[RestaurantResponse]:
 
 @router.get("/kakao/search", response_model=KakaoPlaceSearchResponse)
 def search_kakao_places(query: str, size: int = 5) -> KakaoPlaceSearchResponse:
-    places = search_places(query=query, size=min(max(size, 1), 15))
+    try:
+        places = search_places(query=query, size=min(max(size, 1), 15))
+    except KakaoLocalApiError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.message) from error
     return KakaoPlaceSearchResponse(query=query, places=places)
 
 
