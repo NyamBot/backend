@@ -86,6 +86,9 @@ class ScriptRequest(BaseModel):
 
 
 class ScriptPack(BaseModel):
+    id: str | None = None
+    source_id: str | None = None
+    clip_idea_id: str | None = None
     title: str
     hook: str
     scene_plan: list[str]
@@ -94,6 +97,7 @@ class ScriptPack(BaseModel):
     audio_direction: list[str]
     hashtags: list[str]
     license_checklist: list[str]
+    created_at: str | None = None
 
 
 class AgentChatRequest(BaseModel):
