@@ -1,5 +1,6 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from app.core.dependencies import get_current_user
 from app.schemas import (
     RestaurantChatRequest,
     RestaurantChatResponse,
@@ -10,6 +11,7 @@ from app.schemas import (
     RestaurantRecommendationsResponse,
     RestaurantResponse,
     TasteAgentMessagesResponse,
+    UserResponse,
 )
 from app.services.kakao_local import KakaoLocalApiError, search_places
 from app.services.restaurant_store import restaurant_store
@@ -18,13 +20,16 @@ router = APIRouter(prefix="/api/restaurants", tags=["restaurants"])
 
 
 @router.post("", response_model=RestaurantResponse)
-def create_restaurant(payload: RestaurantCreate) -> RestaurantResponse:
-    return restaurant_store.create_restaurant(payload)
+def create_restaurant(
+    payload: RestaurantCreate,
+    current_user: UserResponse = Depends(get_current_user),
+) -> RestaurantResponse:
+    return restaurant_store.create_restaurant(payload.model_copy(update={"user_id": current_user.id}))
 
 
 @router.get("", response_model=list[RestaurantResponse])
-def list_restaurants(user_id: str | None = None) -> list[RestaurantResponse]:
-    return restaurant_store.list_restaurants(user_id=user_id)
+def list_restaurants(current_user: UserResponse = Depends(get_current_user)) -> list[RestaurantResponse]:
+    return restaurant_store.list_restaurants(user_id=current_user.id)
 
 
 @router.get("/kakao/search", response_model=KakaoPlaceSearchResponse)
@@ -36,16 +41,15 @@ def search_kakao_places(query: str, size: int = 5) -> KakaoPlaceSearchResponse:
     return KakaoPlaceSearchResponse(query=query, places=places)
 
 
-@router.get("/{restaurant_id}", response_model=RestaurantResponse)
-def get_restaurant(restaurant_id: str) -> RestaurantResponse:
-    restaurant = restaurant_store.get_restaurant(restaurant_id)
-    if restaurant is None:
-        raise HTTPException(status_code=404, detail="Restaurant not found")
-    return restaurant
-
-
 @router.post("/{restaurant_id}/notes", response_model=RestaurantResponse)
-def add_restaurant_note(restaurant_id: str, payload: RestaurantNoteCreate) -> RestaurantResponse:
+def add_restaurant_note(
+    restaurant_id: str,
+    payload: RestaurantNoteCreate,
+    current_user: UserResponse = Depends(get_current_user),
+) -> RestaurantResponse:
+    target = restaurant_store.get_restaurant(restaurant_id)
+    if target is None or target.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Restaurant not found")
     restaurant = restaurant_store.add_note(restaurant_id, payload)
     if restaurant is None:
         raise HTTPException(status_code=404, detail="Restaurant not found")
@@ -53,10 +57,13 @@ def add_restaurant_note(restaurant_id: str, payload: RestaurantNoteCreate) -> Re
 
 
 @router.post("/recommendations", response_model=RestaurantRecommendationsResponse)
-def recommend_restaurants(payload: RestaurantRecommendationRequest) -> RestaurantRecommendationsResponse:
+def recommend_restaurants(
+    payload: RestaurantRecommendationRequest,
+    current_user: UserResponse = Depends(get_current_user),
+) -> RestaurantRecommendationsResponse:
     recommendations = restaurant_store.recommend(
         query=payload.query,
-        user_id=payload.user_id,
+        user_id=current_user.id,
         area=payload.area,
         cuisine=payload.cuisine,
         price_level=payload.price_level,
@@ -67,11 +74,14 @@ def recommend_restaurants(payload: RestaurantRecommendationRequest) -> Restauran
 
 
 @router.post("/chat", response_model=RestaurantChatResponse)
-def chat(payload: RestaurantChatRequest) -> RestaurantChatResponse:
+def chat(
+    payload: RestaurantChatRequest,
+    current_user: UserResponse = Depends(get_current_user),
+) -> RestaurantChatResponse:
     query = payload.message or payload.query
     recommendations = restaurant_store.recommend(
         query=query,
-        user_id=payload.user_id,
+        user_id=current_user.id,
         area=payload.area,
         cuisine=payload.cuisine,
         price_level=payload.price_level,
@@ -84,17 +94,28 @@ def chat(payload: RestaurantChatRequest) -> RestaurantChatResponse:
         for evidence in recommendation.evidence
     ]
     answer = _build_answer(query, recommendations)
-    restaurant_store.save_message(payload.user_id, "user", query, [])
-    restaurant_store.save_message(payload.user_id, "assistant", answer, context)
+    restaurant_store.save_message(current_user.id, "user", query, [])
+    restaurant_store.save_message(current_user.id, "assistant", answer, context)
     return RestaurantChatResponse(answer=answer, recommendations=recommendations, context=context)
 
 
 @router.get("/chat/messages", response_model=TasteAgentMessagesResponse)
-def list_messages(user_id: str | None = None) -> TasteAgentMessagesResponse:
+def list_messages(current_user: UserResponse = Depends(get_current_user)) -> TasteAgentMessagesResponse:
     return TasteAgentMessagesResponse(
-        user_id=user_id,
-        messages=restaurant_store.list_messages(user_id),
+        user_id=current_user.id,
+        messages=restaurant_store.list_messages(current_user.id),
     )
+
+
+@router.get("/{restaurant_id}", response_model=RestaurantResponse)
+def get_restaurant(
+    restaurant_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+) -> RestaurantResponse:
+    restaurant = restaurant_store.get_restaurant(restaurant_id)
+    if restaurant is None or restaurant.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Restaurant not found")
+    return restaurant
 
 
 def _build_answer(query: str, recommendations) -> str:

@@ -27,6 +27,12 @@ class UserResponse(BaseModel):
     last_login_at: str | None
 
 
+class AuthCallbackResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
+
 class RestaurantCreate(BaseModel):
     user_id: str | None = None
     name: str = Field(min_length=1, max_length=120)
