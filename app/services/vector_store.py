@@ -1119,9 +1119,9 @@ class VectorStore:
             else:
                 raise ValueError("Unsupported DATABASE_URL")
         except Exception:
-            self.backend = SqliteVectorStore("sqlite:///./data/clipforge.db")
+            self.backend = SqliteVectorStore("sqlite:///./data/tasteforge.db")
             self.backend_name = "sqlite-vector"
-            self.database_url = "sqlite:///./data/clipforge.db"
+            self.database_url = "sqlite:///./data/tasteforge.db"
 
     def add_source(self, title: str, transcript: str, metadata: dict[str, str]) -> tuple[str, int]:
         return self.backend.add_source(title, transcript, metadata)
