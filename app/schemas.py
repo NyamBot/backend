@@ -52,6 +52,15 @@ class SourceDetail(SourceResponse):
     created_at: str
 
 
+class ClipGenerateRequest(BaseModel):
+    source_id: str
+    title: str = "Untitled source"
+    platform: str = "shorts"
+    audience: str = "general creators"
+    goal: str = "awareness"
+    count: int = Field(default=3, ge=1, le=5)
+
+
 class ClipIdea(BaseModel):
     id: str
     title: str
@@ -60,6 +69,9 @@ class ClipIdea(BaseModel):
     platform: str
     duration_seconds: int
     hook_score: int
+    audience_angle: str
+    cta: str
+    platform_fit: str
     source_moments: list[str]
 
 
