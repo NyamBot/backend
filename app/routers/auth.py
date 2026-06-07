@@ -8,7 +8,8 @@ from fastapi.responses import RedirectResponse
 from app.core.config import settings
 from app.core.dependencies import get_current_user
 from app.core.security import create_access_token
-from app.schemas import AuthCallbackResponse, UserResponse
+from app.schemas import AuthCallbackResponse, AuthCodeExchangeRequest, AuthTokenResponse, UserResponse
+from app.services.auth_exchange import auth_code_store
 from app.services.kakao_auth import KakaoAuthError, build_login_url, fetch_kakao_profile
 from app.services.restaurant_store import restaurant_store
 
@@ -44,7 +45,16 @@ def kakao_callback(code: str | None = None, error: str | None = None) -> Redirec
         provider_subject=profile.provider_subject,
     )
     token = create_access_token(user["id"])
-    return RedirectResponse(_frontend_redirect(token=token))
+    auth_code = auth_code_store.issue(token)
+    return RedirectResponse(_frontend_redirect(auth_code=auth_code))
+
+
+@router.post("/session", response_model=AuthTokenResponse)
+def exchange_auth_code(payload: AuthCodeExchangeRequest) -> AuthTokenResponse:
+    token = auth_code_store.consume(payload.code)
+    if not token:
+        raise HTTPException(status_code=400, detail="Invalid or expired auth code")
+    return AuthTokenResponse(access_token=token)
 
 
 @router.get("/me", response_model=UserResponse)

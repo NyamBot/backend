@@ -82,8 +82,8 @@ def _fetch_profile(access_token: str) -> KakaoProfile:
     kakao_id = data.get("id")
     account = data.get("kakao_account") or {}
     profile = account.get("profile") or {}
-    display_name = profile.get("nickname") or "TasteForge User"
-    email = account.get("email") or f"kakao-{kakao_id}@tasteforge.local"
+    display_name = profile.get("nickname") or "NyamBot User"
+    email = account.get("email") or f"kakao-{kakao_id}@nyambot.local"
     avatar_url = profile.get("profile_image_url")
     return KakaoProfile(
         provider_subject=str(kakao_id),

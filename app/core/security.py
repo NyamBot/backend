@@ -50,7 +50,9 @@ def decode_access_token(token: str) -> dict[str, Any] | None:
 
 
 def _jwt_secret() -> bytes:
-    secret = settings.jwt_secret_key or "tasteforge-local-dev-secret"
+    if not settings.jwt_secret_key and settings.app_env.lower() in {"prod", "production"}:
+        raise RuntimeError("JWT_SECRET_KEY must be configured in production")
+    secret = settings.jwt_secret_key or "nyambot-local-dev-secret"
     return secret.encode("utf-8")
 
 
@@ -65,4 +67,3 @@ def _base64url_bytes(value: bytes) -> str:
 def _base64url_decode(value: str) -> bytes:
     padding = "=" * (-len(value) % 4)
     return base64.urlsafe_b64decode(value + padding)
-
