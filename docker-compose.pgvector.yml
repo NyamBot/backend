@@ -2,22 +2,22 @@ services:
   pgvector:
     build:
       context: ./infra/pgvector
-    image: tasteforge-ai-pgvector:latest
-    container_name: tasteforge-ai-pgvector
+    image: nyambot-pgvector:latest
+    container_name: nyambot-pgvector
     environment:
-      POSTGRES_DB: tasteforge
-      POSTGRES_USER: tasteforge
-      POSTGRES_PASSWORD: tasteforge
+      POSTGRES_DB: nyambot
+      POSTGRES_USER: nyambot
+      POSTGRES_PASSWORD: nyambot
     ports:
       - "15432:5432"
     volumes:
-      - tasteforge-ai-pgvector-data:/var/lib/postgresql/data
+      - nyambot-pgvector-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U tasteforge -d tasteforge"]
+      test: ["CMD-SHELL", "pg_isready -U nyambot -d nyambot"]
       interval: 5s
       timeout: 5s
       retries: 10
 
 volumes:
-  tasteforge-ai-pgvector-data:
-    name: tasteforge-ai-pgvector-data
+  nyambot-pgvector-data:
+    name: nyambot-pgvector-data

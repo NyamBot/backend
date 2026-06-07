@@ -50,7 +50,7 @@ class SqliteRestaurantStore:
     def __init__(self, database_url: str) -> None:
         if not database_url.startswith("sqlite:///"):
             raise ValueError("SQLite URL must start with sqlite:///")
-        database_path = Path(database_url.removeprefix("sqlite:///"))
+        database_path = Path(database_url.removeprefix("sqlite:///")).resolve()
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self.database_path = database_path
         self._init_schema()
@@ -78,6 +78,8 @@ class SqliteRestaurantStore:
                     address TEXT,
                     road_address TEXT,
                     phone TEXT,
+                    latitude REAL,
+                    longitude REAL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
@@ -126,6 +128,14 @@ class SqliteRestaurantStore:
                     WHERE provider_subject IS NOT NULL;
                 """
             )
+            for statement in (
+                "ALTER TABLE restaurants ADD COLUMN latitude REAL",
+                "ALTER TABLE restaurants ADD COLUMN longitude REAL",
+            ):
+                try:
+                    connection.execute(statement)
+                except sqlite3.OperationalError:
+                    pass
 
     def create_user(
         self,
@@ -224,9 +234,9 @@ class SqliteRestaurantStore:
                 INSERT INTO restaurants (
                     id, user_id, name, area, cuisine, price_level, mood_tags_json,
                     signature_menus_json, kakao_place_id, kakao_place_url,
-                    address, road_address, phone
+                    address, road_address, phone, latitude, longitude
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     restaurant_id,
@@ -242,6 +252,8 @@ class SqliteRestaurantStore:
                     payload.address,
                     payload.road_address,
                     payload.phone,
+                    payload.latitude,
+                    payload.longitude,
                 ),
             )
             connection.execute(
@@ -443,6 +455,8 @@ class SqliteRestaurantStore:
             address=row["address"],
             road_address=row["road_address"],
             phone=row["phone"],
+            latitude=row["latitude"],
+            longitude=row["longitude"],
             note_count=int(row["note_count"]),
             created_at=row["created_at"],
         )
@@ -504,10 +518,14 @@ class PgRestaurantStore(SqliteRestaurantStore):
                         address TEXT,
                         road_address TEXT,
                         phone TEXT,
+                        latitude DOUBLE PRECISION,
+                        longitude DOUBLE PRECISION,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     )
                     """
                 )
+                cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION")
+                cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_restaurants_user_id ON restaurants(user_id)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_restaurants_area ON restaurants(area)")
                 cursor.execute(
@@ -579,9 +597,9 @@ class PgRestaurantStore(SqliteRestaurantStore):
                     INSERT INTO restaurants (
                         id, user_id, name, area, cuisine, price_level, mood_tags_json,
                         signature_menus_json, kakao_place_id, kakao_place_url,
-                        address, road_address, phone
+                        address, road_address, phone, latitude, longitude
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         restaurant_id,
@@ -597,6 +615,8 @@ class PgRestaurantStore(SqliteRestaurantStore):
                         payload.address,
                         payload.road_address,
                         payload.phone,
+                        payload.latitude,
+                        payload.longitude,
                     ),
                 )
                 cursor.execute(
@@ -871,7 +891,7 @@ class RestaurantStore:
             else:
                 raise ValueError("Unsupported DATABASE_URL")
         except Exception:
-            self.backend = SqliteRestaurantStore("sqlite:///./data/tasteforge.db")
+            self.backend = SqliteRestaurantStore("sqlite:///./data/nyambot.db")
 
     def create_restaurant(self, payload: RestaurantCreate) -> RestaurantResponse:
         return self.backend.create_restaurant(payload)
