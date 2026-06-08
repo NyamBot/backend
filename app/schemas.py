@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -47,10 +49,25 @@ class RestaurantCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     area: str = Field(min_length=1, max_length=80)
     cuisine: str = Field(min_length=1, max_length=80)
-    price_level: str = "보통"
+    price_level: str = "1~2만원"
     mood_tags: list[str] = []
     signature_menus: list[str] = []
     note: str = Field(min_length=10)
+    kakao_place_id: str | None = None
+    kakao_place_url: str | None = None
+    address: str | None = None
+    road_address: str | None = None
+    phone: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+
+
+class RestaurantUpdate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    area: str = Field(min_length=1, max_length=80)
+    cuisine: str = Field(min_length=1, max_length=80)
+    price_level: str
+    mood_tags: list[str] = []
     kakao_place_id: str | None = None
     kakao_place_url: str | None = None
     address: str | None = None
@@ -118,6 +135,8 @@ class RestaurantRecommendationRequest(BaseModel):
     cuisine: str | None = None
     price_level: str | None = None
     tags: list[str] = []
+    latitude: float | None = None
+    longitude: float | None = None
     limit: int = Field(default=3, ge=1, le=5)
 
 
@@ -137,9 +156,11 @@ class RestaurantRecommendationsResponse(BaseModel):
 
 class RestaurantChatRequest(RestaurantRecommendationRequest):
     message: str = Field(min_length=1)
+    session_id: str | None = None
 
 
 class RestaurantChatResponse(BaseModel):
+    session_id: str
     answer: str
     recommendations: list[RestaurantRecommendation]
     context: list[str]
@@ -147,13 +168,29 @@ class RestaurantChatResponse(BaseModel):
 
 class TasteAgentMessage(BaseModel):
     id: str
+    session_id: str | None = None
     user_id: str | None
     role: str
     content: str
     retrieved_context: list[str]
+    metadata: dict[str, Any] = {}
     created_at: str
+
+
+class TasteAgentSession(BaseModel):
+    id: str
+    user_id: str | None
+    title: str
+    created_at: str
+    updated_at: str
+    messages: list[TasteAgentMessage]
 
 
 class TasteAgentMessagesResponse(BaseModel):
     user_id: str | None
     messages: list[TasteAgentMessage]
+
+
+class TasteAgentSessionsResponse(BaseModel):
+    user_id: str | None
+    sessions: list[TasteAgentSession]

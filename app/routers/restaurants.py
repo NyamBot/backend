@@ -14,7 +14,9 @@ from app.schemas import (
     RestaurantRecommendationRequest,
     RestaurantRecommendationsResponse,
     RestaurantResponse,
+    RestaurantUpdate,
     TasteAgentMessagesResponse,
+    TasteAgentSessionsResponse,
     UserResponse,
 )
 from app.services.kakao_local import KakaoLocalApiError, get_kakao_local_api_key, search_places
@@ -90,6 +92,32 @@ def add_restaurant_note(
     return restaurant
 
 
+@router.put("/{restaurant_id}", response_model=RestaurantResponse)
+def update_restaurant(
+    restaurant_id: str,
+    payload: RestaurantUpdate,
+    current_user: UserResponse = Depends(get_current_user),
+) -> RestaurantResponse:
+    target = restaurant_store.get_restaurant(restaurant_id)
+    if target is None or target.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Restaurant not found")
+    restaurant = restaurant_store.update_restaurant(restaurant_id, payload)
+    if restaurant is None:
+        raise HTTPException(status_code=404, detail="Restaurant not found")
+    return restaurant
+
+
+@router.delete("/{restaurant_id}", status_code=204)
+def delete_restaurant(
+    restaurant_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+) -> None:
+    target = restaurant_store.get_restaurant(restaurant_id)
+    if target is None or target.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Restaurant not found")
+    restaurant_store.delete_restaurant(restaurant_id)
+
+
 @router.post("/recommendations", response_model=RestaurantRecommendationsResponse)
 def recommend_restaurants(
     payload: RestaurantRecommendationRequest,
@@ -102,6 +130,8 @@ def recommend_restaurants(
         cuisine=payload.cuisine,
         price_level=payload.price_level,
         tags=payload.tags,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
         limit=payload.limit,
     )
     return RestaurantRecommendationsResponse(query=payload.query, recommendations=recommendations)
@@ -113,6 +143,7 @@ def chat(
     current_user: UserResponse = Depends(get_current_user),
 ) -> RestaurantChatResponse:
     query = payload.message or payload.query
+    session_id = restaurant_store.ensure_chat_session(current_user.id, payload.session_id, query)
     recommendations = restaurant_store.recommend(
         query=query,
         user_id=current_user.id,
@@ -120,6 +151,8 @@ def chat(
         cuisine=payload.cuisine,
         price_level=payload.price_level,
         tags=payload.tags,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
         limit=payload.limit,
     )
     has_saved_restaurants = bool(restaurant_store.list_restaurants(user_id=current_user.id))
@@ -131,9 +164,29 @@ def chat(
         for evidence in recommendation.evidence
     ]
     answer = _build_answer(query, recommendations, fallback=not has_saved_restaurants)
-    restaurant_store.save_message(current_user.id, "user", query, [])
-    restaurant_store.save_message(current_user.id, "assistant", answer, context)
-    return RestaurantChatResponse(answer=answer, recommendations=recommendations, context=context)
+    request_metadata = {
+        "area": payload.area,
+        "cuisine": payload.cuisine,
+        "price_level": payload.price_level,
+        "tags": payload.tags,
+        "latitude": payload.latitude,
+        "longitude": payload.longitude,
+        "limit": payload.limit,
+    }
+    restaurant_store.save_message(session_id, current_user.id, "user", query, [], request_metadata)
+    restaurant_store.save_message(
+        session_id,
+        current_user.id,
+        "assistant",
+        answer,
+        context,
+        {
+            "recommendation_count": len(recommendations),
+            "restaurant_names": [recommendation.restaurant.name for recommendation in recommendations],
+        },
+    )
+    restaurant_store.touch_chat_session(session_id)
+    return RestaurantChatResponse(session_id=session_id, answer=answer, recommendations=recommendations, context=context)
 
 
 @router.get("/chat/messages", response_model=TasteAgentMessagesResponse)
@@ -141,6 +194,14 @@ def list_messages(current_user: UserResponse = Depends(get_current_user)) -> Tas
     return TasteAgentMessagesResponse(
         user_id=current_user.id,
         messages=restaurant_store.list_messages(current_user.id),
+    )
+
+
+@router.get("/chat/sessions", response_model=TasteAgentSessionsResponse)
+def list_sessions(current_user: UserResponse = Depends(get_current_user)) -> TasteAgentSessionsResponse:
+    return TasteAgentSessionsResponse(
+        user_id=current_user.id,
+        sessions=restaurant_store.list_sessions(current_user.id),
     )
 
 
@@ -198,7 +259,7 @@ def _build_fallback_recommendations(query: str, limit: int) -> list[RestaurantRe
             "name": "성수 조용한 비스트로",
             "area": "성수",
             "cuisine": "양식",
-            "price_level": "보통",
+            "price_level": "2~3만원",
             "mood_tags": ["조용함", "데이트", "예약 추천"],
             "signature_menus": ["파스타", "스테이크"],
             "reason": f"'{query_hint}'에 맞춰 대화하기 좋고 실패 확률이 낮은 분위기의 1순위 후보입니다.",
@@ -210,7 +271,7 @@ def _build_fallback_recommendations(query: str, limit: int) -> list[RestaurantRe
             "name": "합정 담백한 한식집",
             "area": "합정",
             "cuisine": "한식",
-            "price_level": "무난",
+            "price_level": "1~2만원",
             "mood_tags": ["혼밥", "친구", "깔끔함"],
             "signature_menus": ["정식", "국밥"],
             "reason": "메뉴 호불호가 적고 혼밥부터 가벼운 약속까지 커버하기 좋아 2순위로 추천합니다.",
@@ -222,7 +283,7 @@ def _build_fallback_recommendations(query: str, limit: int) -> list[RestaurantRe
             "name": "연남 캐주얼 아시안 다이닝",
             "area": "연남",
             "cuisine": "아시안",
-            "price_level": "보통",
+            "price_level": "2~3만원",
             "mood_tags": ["캐주얼", "데이트", "친구"],
             "signature_menus": ["쌀국수", "볶음밥"],
             "reason": "분위기는 가볍고 메뉴 선택지는 넓어서 즉흥 약속용 3순위 후보로 좋습니다.",
@@ -256,7 +317,7 @@ def _build_fallback_recommendations(query: str, limit: int) -> list[RestaurantRe
                 restaurant=restaurant,
                 reason=option["reason"],
                 evidence=[option["evidence"]],
-                menu_tip=f"추천 메뉴: {', '.join(option['signature_menus'])}",
+                menu_tip=f"추천 포인트: {', '.join(option['signature_menus'])}",
                 caution=option["caution"],
                 score=score,
             )
