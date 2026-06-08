@@ -1,0 +1,23 @@
+services:
+  pgvector:
+    build:
+      context: ./infra/pgvector
+    image: clipforge-ai-pgvector:latest
+    container_name: clipforge-ai-pgvector
+    environment:
+      POSTGRES_DB: clipforge
+      POSTGRES_USER: clipforge
+      POSTGRES_PASSWORD: clipforge
+    ports:
+      - "15432:5432"
+    volumes:
+      - clipforge-ai-pgvector-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clipforge -d clipforge"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  clipforge-ai-pgvector-data:
+    name: clipforge-ai-pgvector-data
