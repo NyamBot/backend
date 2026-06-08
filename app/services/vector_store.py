@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from app.core.config import settings
+from app.schemas import ClipIdea, ScriptPack
 from app.services.chunker import chunk_text
 
 
@@ -98,6 +99,46 @@ class SqliteVectorStore:
 
                 CREATE INDEX IF NOT EXISTS idx_source_chunks_source_id
                     ON source_chunks(source_id);
+
+                CREATE TABLE IF NOT EXISTS clip_ideas (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    hook TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    duration_seconds INTEGER NOT NULL,
+                    hook_score INTEGER NOT NULL,
+                    audience_angle TEXT NOT NULL,
+                    cta TEXT NOT NULL,
+                    platform_fit TEXT NOT NULL,
+                    source_moments_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_clip_ideas_source_id
+                    ON clip_ideas(source_id);
+
+                CREATE TABLE IF NOT EXISTS campaign_packs (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                    clip_idea_id TEXT NOT NULL REFERENCES clip_ideas(id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    hook TEXT NOT NULL,
+                    scene_plan_json TEXT NOT NULL,
+                    captions_json TEXT NOT NULL,
+                    b_roll_json TEXT NOT NULL,
+                    audio_direction_json TEXT NOT NULL,
+                    hashtags_json TEXT NOT NULL,
+                    license_checklist_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_campaign_packs_source_id
+                    ON campaign_packs(source_id);
+
+                CREATE INDEX IF NOT EXISTS idx_campaign_packs_clip_idea_id
+                    ON campaign_packs(clip_idea_id);
                 """
             )
             self._ensure_sqlite_column(connection, "sources", "user_id", "TEXT REFERENCES users(id) ON DELETE SET NULL")
@@ -271,6 +312,153 @@ class SqliteVectorStore:
         )
         return [row["document"] for row in ranked[:limit]]
 
+    def save_clip_ideas(self, source_id: str, ideas: list[ClipIdea]) -> list[ClipIdea]:
+        with self._connect() as connection:
+            connection.executemany(
+                """
+                INSERT OR REPLACE INTO clip_ideas (
+                    id, source_id, title, hook, summary, platform,
+                    duration_seconds, hook_score, audience_angle, cta,
+                    platform_fit, source_moments_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        idea.id,
+                        source_id,
+                        idea.title,
+                        idea.hook,
+                        idea.summary,
+                        idea.platform,
+                        idea.duration_seconds,
+                        idea.hook_score,
+                        idea.audience_angle,
+                        idea.cta,
+                        idea.platform_fit,
+                        json.dumps(idea.source_moments, ensure_ascii=False),
+                    )
+                    for idea in ideas
+                ],
+            )
+        return ideas
+
+    def list_clip_ideas(self, source_id: str) -> list[ClipIdea]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, title, hook, summary, platform, duration_seconds,
+                    hook_score, audience_angle, cta, platform_fit,
+                    source_moments_json
+                FROM clip_ideas
+                WHERE source_id = ?
+                ORDER BY created_at DESC
+                """,
+                (source_id,),
+            ).fetchall()
+        return [
+            ClipIdea(
+                id=row["id"],
+                title=row["title"],
+                hook=row["hook"],
+                summary=row["summary"],
+                platform=row["platform"],
+                duration_seconds=row["duration_seconds"],
+                hook_score=row["hook_score"],
+                audience_angle=row["audience_angle"],
+                cta=row["cta"],
+                platform_fit=row["platform_fit"],
+                source_moments=json.loads(row["source_moments_json"]),
+            )
+            for row in rows
+        ]
+
+    def save_campaign_pack(
+        self,
+        source_id: str,
+        clip_idea_id: str,
+        pack: ScriptPack,
+    ) -> ScriptPack:
+        pack_id = str(uuid4())
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO campaign_packs (
+                    id, source_id, clip_idea_id, title, hook, scene_plan_json,
+                    captions_json, b_roll_json, audio_direction_json,
+                    hashtags_json, license_checklist_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    pack_id,
+                    source_id,
+                    clip_idea_id,
+                    pack.title,
+                    pack.hook,
+                    json.dumps(pack.scene_plan, ensure_ascii=False),
+                    json.dumps(pack.captions, ensure_ascii=False),
+                    json.dumps(pack.b_roll, ensure_ascii=False),
+                    json.dumps(pack.audio_direction, ensure_ascii=False),
+                    json.dumps(pack.hashtags, ensure_ascii=False),
+                    json.dumps(pack.license_checklist, ensure_ascii=False),
+                ),
+            )
+        saved = self.get_campaign_pack(pack_id)
+        if saved is None:
+            raise RuntimeError("Created campaign pack could not be loaded")
+        return saved
+
+    def list_campaign_packs(
+        self,
+        source_id: str,
+        clip_idea_id: str | None = None,
+    ) -> list[ScriptPack]:
+        where_clause = "WHERE source_id = ?"
+        params: tuple[str, ...] = (source_id,)
+        if clip_idea_id:
+            where_clause += " AND clip_idea_id = ?"
+            params = (source_id, clip_idea_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT *
+                FROM campaign_packs
+                {where_clause}
+                ORDER BY created_at DESC
+                """,
+                params,
+            ).fetchall()
+        return [self._script_pack_from_row(row) for row in rows]
+
+    def get_campaign_pack(self, pack_id: str) -> ScriptPack | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM campaign_packs
+                WHERE id = ?
+                """,
+                (pack_id,),
+            ).fetchone()
+        return self._script_pack_from_row(row) if row else None
+
+    def _script_pack_from_row(self, row: sqlite3.Row) -> ScriptPack:
+        return ScriptPack(
+            id=row["id"],
+            source_id=row["source_id"],
+            clip_idea_id=row["clip_idea_id"],
+            title=row["title"],
+            hook=row["hook"],
+            scene_plan=json.loads(row["scene_plan_json"]),
+            captions=json.loads(row["captions_json"]),
+            b_roll=json.loads(row["b_roll_json"]),
+            audio_direction=json.loads(row["audio_direction_json"]),
+            hashtags=json.loads(row["hashtags_json"]),
+            license_checklist=json.loads(row["license_checklist_json"]),
+            created_at=row["created_at"],
+        )
+
 
 class PgVectorStore:
     def __init__(self, database_url: str) -> None:
@@ -340,6 +528,61 @@ class PgVectorStore:
                     """
                     CREATE INDEX IF NOT EXISTS idx_source_chunks_source_id
                         ON source_chunks(source_id)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS clip_ideas (
+                        id TEXT PRIMARY KEY,
+                        source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                        title TEXT NOT NULL,
+                        hook TEXT NOT NULL,
+                        summary TEXT NOT NULL,
+                        platform TEXT NOT NULL,
+                        duration_seconds INTEGER NOT NULL,
+                        hook_score INTEGER NOT NULL,
+                        audience_angle TEXT NOT NULL,
+                        cta TEXT NOT NULL,
+                        platform_fit TEXT NOT NULL,
+                        source_moments_json TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_clip_ideas_source_id
+                        ON clip_ideas(source_id)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS campaign_packs (
+                        id TEXT PRIMARY KEY,
+                        source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                        clip_idea_id TEXT NOT NULL REFERENCES clip_ideas(id) ON DELETE CASCADE,
+                        title TEXT NOT NULL,
+                        hook TEXT NOT NULL,
+                        scene_plan_json TEXT NOT NULL,
+                        captions_json TEXT NOT NULL,
+                        b_roll_json TEXT NOT NULL,
+                        audio_direction_json TEXT NOT NULL,
+                        hashtags_json TEXT NOT NULL,
+                        license_checklist_json TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_campaign_packs_source_id
+                        ON campaign_packs(source_id)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_campaign_packs_clip_idea_id
+                        ON campaign_packs(clip_idea_id)
                     """
                 )
                 self._ensure_pg_column(cursor, "sources", "user_id", "TEXT REFERENCES users(id) ON DELETE SET NULL")
@@ -527,6 +770,178 @@ class PgVectorStore:
                 )
                 return [row[0] for row in cursor.fetchall()]
 
+    def save_clip_ideas(self, source_id: str, ideas: list[ClipIdea]) -> list[ClipIdea]:
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.executemany(
+                    """
+                    INSERT INTO clip_ideas (
+                        id, source_id, title, hook, summary, platform,
+                        duration_seconds, hook_score, audience_angle, cta,
+                        platform_fit, source_moments_json
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        title = EXCLUDED.title,
+                        hook = EXCLUDED.hook,
+                        summary = EXCLUDED.summary,
+                        platform = EXCLUDED.platform,
+                        duration_seconds = EXCLUDED.duration_seconds,
+                        hook_score = EXCLUDED.hook_score,
+                        audience_angle = EXCLUDED.audience_angle,
+                        cta = EXCLUDED.cta,
+                        platform_fit = EXCLUDED.platform_fit,
+                        source_moments_json = EXCLUDED.source_moments_json
+                    """,
+                    [
+                        (
+                            idea.id,
+                            source_id,
+                            idea.title,
+                            idea.hook,
+                            idea.summary,
+                            idea.platform,
+                            idea.duration_seconds,
+                            idea.hook_score,
+                            idea.audience_angle,
+                            idea.cta,
+                            idea.platform_fit,
+                            json.dumps(idea.source_moments, ensure_ascii=False),
+                        )
+                        for idea in ideas
+                    ],
+                )
+        return ideas
+
+    def list_clip_ideas(self, source_id: str) -> list[ClipIdea]:
+        with self._connect() as connection:
+            with connection.cursor(row_factory=self.dict_row) as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, title, hook, summary, platform, duration_seconds,
+                        hook_score, audience_angle, cta, platform_fit,
+                        source_moments_json
+                    FROM clip_ideas
+                    WHERE source_id = %s
+                    ORDER BY created_at DESC
+                    """,
+                    (source_id,),
+                )
+                rows = cursor.fetchall()
+        return [
+            ClipIdea(
+                id=row["id"],
+                title=row["title"],
+                hook=row["hook"],
+                summary=row["summary"],
+                platform=row["platform"],
+                duration_seconds=row["duration_seconds"],
+                hook_score=row["hook_score"],
+                audience_angle=row["audience_angle"],
+                cta=row["cta"],
+                platform_fit=row["platform_fit"],
+                source_moments=json.loads(row["source_moments_json"]),
+            )
+            for row in rows
+        ]
+
+    def save_campaign_pack(
+        self,
+        source_id: str,
+        clip_idea_id: str,
+        pack: ScriptPack,
+    ) -> ScriptPack:
+        pack_id = str(uuid4())
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO campaign_packs (
+                        id, source_id, clip_idea_id, title, hook, scene_plan_json,
+                        captions_json, b_roll_json, audio_direction_json,
+                        hashtags_json, license_checklist_json
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        pack_id,
+                        source_id,
+                        clip_idea_id,
+                        pack.title,
+                        pack.hook,
+                        json.dumps(pack.scene_plan, ensure_ascii=False),
+                        json.dumps(pack.captions, ensure_ascii=False),
+                        json.dumps(pack.b_roll, ensure_ascii=False),
+                        json.dumps(pack.audio_direction, ensure_ascii=False),
+                        json.dumps(pack.hashtags, ensure_ascii=False),
+                        json.dumps(pack.license_checklist, ensure_ascii=False),
+                    ),
+                )
+        saved = self.get_campaign_pack(pack_id)
+        if saved is None:
+            raise RuntimeError("Created campaign pack could not be loaded")
+        return saved
+
+    def list_campaign_packs(
+        self,
+        source_id: str,
+        clip_idea_id: str | None = None,
+    ) -> list[ScriptPack]:
+        where_clause = "WHERE source_id = %s"
+        params: tuple[str, ...] = (source_id,)
+        if clip_idea_id:
+            where_clause += " AND clip_idea_id = %s"
+            params = (source_id, clip_idea_id)
+        with self._connect() as connection:
+            with connection.cursor(row_factory=self.dict_row) as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT id, source_id, clip_idea_id, title, hook,
+                        scene_plan_json, captions_json, b_roll_json,
+                        audio_direction_json, hashtags_json,
+                        license_checklist_json, created_at::text AS created_at
+                    FROM campaign_packs
+                    {where_clause}
+                    ORDER BY created_at DESC
+                    """,
+                    params,
+                )
+                rows = cursor.fetchall()
+        return [self._script_pack_from_row(row) for row in rows]
+
+    def get_campaign_pack(self, pack_id: str) -> ScriptPack | None:
+        with self._connect() as connection:
+            with connection.cursor(row_factory=self.dict_row) as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, source_id, clip_idea_id, title, hook,
+                        scene_plan_json, captions_json, b_roll_json,
+                        audio_direction_json, hashtags_json,
+                        license_checklist_json, created_at::text AS created_at
+                    FROM campaign_packs
+                    WHERE id = %s
+                    """,
+                    (pack_id,),
+                )
+                row = cursor.fetchone()
+        return self._script_pack_from_row(row) if row else None
+
+    def _script_pack_from_row(self, row: dict[str, Any]) -> ScriptPack:
+        return ScriptPack(
+            id=row["id"],
+            source_id=row["source_id"],
+            clip_idea_id=row["clip_idea_id"],
+            title=row["title"],
+            hook=row["hook"],
+            scene_plan=json.loads(row["scene_plan_json"]),
+            captions=json.loads(row["captions_json"]),
+            b_roll=json.loads(row["b_roll_json"]),
+            audio_direction=json.loads(row["audio_direction_json"]),
+            hashtags=json.loads(row["hashtags_json"]),
+            license_checklist=json.loads(row["license_checklist_json"]),
+            created_at=row["created_at"],
+        )
+
 
 class VectorStore:
     def __init__(self) -> None:
@@ -582,6 +997,27 @@ class VectorStore:
 
     def search(self, source_id: str, query: str, limit: int = 5) -> list[str]:
         return self.backend.search(source_id, query, limit)
+
+    def save_clip_ideas(self, source_id: str, ideas: list[ClipIdea]) -> list[ClipIdea]:
+        return self.backend.save_clip_ideas(source_id, ideas)
+
+    def list_clip_ideas(self, source_id: str) -> list[ClipIdea]:
+        return self.backend.list_clip_ideas(source_id)
+
+    def save_campaign_pack(
+        self,
+        source_id: str,
+        clip_idea_id: str,
+        pack: ScriptPack,
+    ) -> ScriptPack:
+        return self.backend.save_campaign_pack(source_id, clip_idea_id, pack)
+
+    def list_campaign_packs(
+        self,
+        source_id: str,
+        clip_idea_id: str | None = None,
+    ) -> list[ScriptPack]:
+        return self.backend.list_campaign_packs(source_id, clip_idea_id)
 
 
 vector_store = VectorStore()
