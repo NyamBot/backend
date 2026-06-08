@@ -332,9 +332,25 @@ class SqliteRestaurantStore:
             )
         return self.get_restaurant(restaurant_id)
 
-    def list_restaurants(self, user_id: str | None = None) -> list[RestaurantResponse]:
-        where_clause = "WHERE restaurants.user_id = ?" if user_id else ""
-        params = (user_id,) if user_id else ()
+    def list_restaurants(
+        self,
+        user_id: str | None = None,
+        city: str | None = None,
+        district: str | None = None,
+        town: str | None = None,
+    ) -> list[RestaurantResponse]:
+        clauses = []
+        params: list[str] = []
+        if user_id:
+            clauses.append("restaurants.user_id = ?")
+            params.append(user_id)
+        for value in (city, district, town):
+            if value:
+                clauses.append(
+                    "(restaurants.road_address LIKE ? OR restaurants.address LIKE ? OR restaurants.area LIKE ?)"
+                )
+                params.extend([f"%{value}%", f"%{value}%", f"%{value}%"])
+        where_clause = "WHERE " + " AND ".join(clauses) if clauses else ""
         with self._connect() as connection:
             rows = connection.execute(
                 f"""
@@ -345,7 +361,7 @@ class SqliteRestaurantStore:
                 GROUP BY restaurants.id
                 ORDER BY restaurants.created_at DESC
                 """,
-                params,
+                tuple(params),
             ).fetchall()
         return [self._restaurant_from_row(row) for row in rows]
 
@@ -957,9 +973,25 @@ class PgRestaurantStore(SqliteRestaurantStore):
                 )
                 return cursor.fetchone()
 
-    def list_restaurants(self, user_id: str | None = None) -> list[RestaurantResponse]:
-        where_clause = "WHERE restaurants.user_id = %s" if user_id else ""
-        params = (user_id,) if user_id else ()
+    def list_restaurants(
+        self,
+        user_id: str | None = None,
+        city: str | None = None,
+        district: str | None = None,
+        town: str | None = None,
+    ) -> list[RestaurantResponse]:
+        clauses = []
+        params: list[str] = []
+        if user_id:
+            clauses.append("restaurants.user_id = %s")
+            params.append(user_id)
+        for value in (city, district, town):
+            if value:
+                clauses.append(
+                    "(restaurants.road_address ILIKE %s OR restaurants.address ILIKE %s OR restaurants.area ILIKE %s)"
+                )
+                params.extend([f"%{value}%", f"%{value}%", f"%{value}%"])
+        where_clause = "WHERE " + " AND ".join(clauses) if clauses else ""
         with self._connect() as connection:
             with connection.cursor(row_factory=self.dict_row) as cursor:
                 cursor.execute(
@@ -972,7 +1004,7 @@ class PgRestaurantStore(SqliteRestaurantStore):
                     GROUP BY restaurants.id
                     ORDER BY restaurants.created_at DESC
                     """,
-                    params,
+                    tuple(params),
                 )
                 rows = cursor.fetchall()
         return [self._restaurant_from_row(row) for row in rows]
@@ -1042,6 +1074,94 @@ class PgRestaurantStore(SqliteRestaurantStore):
                 deleted = cursor.rowcount > 0
             connection.commit()
         return deleted
+
+    def recommend(
+        self,
+        query: str,
+        user_id: str | None,
+        area: str | None,
+        cuisine: str | None,
+        price_level: str | None,
+        tags: list[str],
+        latitude: float | None,
+        longitude: float | None,
+        limit: int,
+    ) -> list[RestaurantRecommendation]:
+        query_text = " ".join([query, area or "", cuisine or "", price_level or "", " ".join(tags)])
+        query_embedding = _embedding_to_pgvector(_embed(query_text))
+        rows = self._search_vector_note_rows(query_embedding, user_id, area, cuisine, price_level, limit * 8)
+        scored: dict[str, dict[str, Any]] = {}
+        normalized_terms = {term.lower() for term in tags + [query, area or "", cuisine or "", price_level or ""] if term}
+        for row in rows:
+            note_tags = {tag.lower() for tag in _json_list(row["tags_json"])}
+            restaurant_tags = {tag.lower() for tag in _json_list(row["mood_tags_json"])}
+            vector_score = float(row["vector_score"])
+            tag_score = 0.08 * len(normalized_terms & (note_tags | restaurant_tags))
+            keyword_score = 0.05 if any(term and term in row["content"].lower() for term in normalized_terms) else 0.0
+            distance = _distance_km(latitude, longitude, row["latitude"], row["longitude"])
+            distance_score = 0.0 if distance is None else max(0.0, 0.18 - min(distance, 10.0) * 0.018)
+            score = vector_score + tag_score + keyword_score + distance_score
+            bucket = scored.setdefault(
+                row["id"],
+                {
+                    "restaurant": self._restaurant_from_row(row),
+                    "score": 0.0,
+                    "evidence": [],
+                    "distance_km": distance,
+                },
+            )
+            bucket["score"] = max(bucket["score"], score)
+            if distance is not None:
+                bucket["distance_km"] = distance
+            if len(bucket["evidence"]) < 2:
+                bucket["evidence"].append(row["content"])
+        ranked = sorted(scored.values(), key=lambda item: item["score"], reverse=True)
+        return [self._recommendation_from_bucket(item) for item in ranked[:limit]]
+
+    def _search_vector_note_rows(
+        self,
+        query_embedding: str,
+        user_id: str | None,
+        area: str | None,
+        cuisine: str | None,
+        price_level: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = [query_embedding]
+        if user_id:
+            clauses.append("restaurants.user_id = %s")
+            params.append(user_id)
+        if area:
+            clauses.append("restaurants.area ILIKE %s")
+            params.append(f"%{area}%")
+        if cuisine:
+            clauses.append("restaurants.cuisine ILIKE %s")
+            params.append(f"%{cuisine}%")
+        if price_level:
+            clauses.append("restaurants.price_level = %s")
+            params.append(price_level)
+        where_clause = "WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(max(limit, 1))
+        with self._connect() as connection:
+            with connection.cursor(row_factory=self.dict_row) as cursor:
+                cursor.execute(
+                    f"""
+                    WITH query_embedding AS (SELECT %s::vector AS embedding)
+                    SELECT restaurants.*, restaurants.created_at::text AS created_at,
+                        COUNT(restaurant_notes.id) OVER (PARTITION BY restaurants.id)::int AS note_count,
+                        restaurant_notes.content, restaurant_notes.tags_json,
+                        1 - (restaurant_notes.embedding <=> query_embedding.embedding) AS vector_score
+                    FROM restaurant_notes
+                    JOIN restaurants ON restaurants.id = restaurant_notes.restaurant_id
+                    CROSS JOIN query_embedding
+                    {where_clause}
+                    ORDER BY restaurant_notes.embedding <=> query_embedding.embedding
+                    LIMIT %s
+                    """,
+                    tuple(params),
+                )
+                return list(cursor.fetchall())
 
     def _search_note_rows(
         self,
@@ -1235,15 +1355,20 @@ class PgRestaurantStore(SqliteRestaurantStore):
 
 class RestaurantStore:
     def __init__(self) -> None:
+        self.initialization_error: str | None = None
         try:
             if settings.database_url.startswith(("postgresql://", "postgres://")):
                 self.backend = PgRestaurantStore(settings.database_url)
+                self.backend_name = "pgvector"
             elif settings.database_url.startswith("sqlite:///"):
                 self.backend = SqliteRestaurantStore(settings.database_url)
+                self.backend_name = "sqlite-vector"
             else:
                 raise ValueError("Unsupported DATABASE_URL")
-        except Exception:
+        except Exception as error:
+            self.initialization_error = str(error)
             self.backend = SqliteRestaurantStore("sqlite:///./data/nyambot.db")
+            self.backend_name = "sqlite-vector"
 
     def create_restaurant(self, payload: RestaurantCreate) -> RestaurantResponse:
         return self.backend.create_restaurant(payload)
@@ -1280,8 +1405,14 @@ class RestaurantStore:
     def get_user_by_provider(self, auth_provider: str, provider_subject: str) -> dict[str, Any] | None:
         return self.backend.get_user_by_provider(auth_provider, provider_subject)
 
-    def list_restaurants(self, user_id: str | None = None) -> list[RestaurantResponse]:
-        return self.backend.list_restaurants(user_id)
+    def list_restaurants(
+        self,
+        user_id: str | None = None,
+        city: str | None = None,
+        district: str | None = None,
+        town: str | None = None,
+    ) -> list[RestaurantResponse]:
+        return self.backend.list_restaurants(user_id, city, district, town)
 
     def get_restaurant(self, restaurant_id: str) -> RestaurantResponse | None:
         return self.backend.get_restaurant(restaurant_id)

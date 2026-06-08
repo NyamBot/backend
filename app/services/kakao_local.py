@@ -16,15 +16,28 @@ class KakaoLocalApiError(Exception):
         super().__init__(message)
 
 
-def search_places(query: str, size: int = 5) -> list[KakaoPlace]:
+def search_places(
+    query: str,
+    size: int = 5,
+    x: float | None = None,
+    y: float | None = None,
+    radius: int | None = None,
+) -> list[KakaoPlace]:
     api_key = get_kakao_local_api_key()
     if not api_key:
         raise KakaoLocalApiError(400, "KAKAO_LOCAL_REST_API_KEY is not configured")
 
+    params: dict[str, str | int | float] = {"query": query, "size": size}
+    if x is not None and y is not None:
+        params["x"] = x
+        params["y"] = y
+    if radius is not None:
+        params["radius"] = radius
+
     try:
         response = httpx.get(
             KAKAO_LOCAL_SEARCH_URL,
-            params={"query": query, "size": size},
+            params=params,
             headers={"Authorization": f"KakaoAK {api_key}"},
             timeout=10,
         )

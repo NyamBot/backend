@@ -16,6 +16,11 @@ class Settings(BaseSettings):
     kakao_local_rest_api_key: str | None = None
     kakao_redirect_uri: str = "http://localhost:8000/api/auth/kakao/callback"
     jwt_secret_key: str | None = None
+    hf_token: str | None = None
+    huggingface_api_token: str | None = None
+    huggingface_chat_base_url: str = "https://router.huggingface.co/v1"
+    huggingface_chat_model: str = "google/gemma-4-26B-A4B-it:featherless-ai"
+    huggingface_chat_timeout_seconds: float = 20.0
 
     model_config = SettingsConfigDict(
         env_file=(".env", f".env.{APP_ENV}"),
