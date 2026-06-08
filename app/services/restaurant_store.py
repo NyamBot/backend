@@ -14,7 +14,9 @@ from app.schemas import (
     RestaurantNoteCreate,
     RestaurantRecommendation,
     RestaurantResponse,
+    RestaurantUpdate,
     TasteAgentMessage,
+    TasteAgentSession,
 )
 
 VECTOR_DIMENSIONS = 96
@@ -32,6 +34,23 @@ def _embed(text: str) -> list[float]:
 
 def _cosine(left: list[float], right: list[float]) -> float:
     return sum(a * b for a, b in zip(left, right))
+
+
+def _distance_km(
+    left_latitude: float | None,
+    left_longitude: float | None,
+    right_latitude: float | None,
+    right_longitude: float | None,
+) -> float | None:
+    if None in (left_latitude, left_longitude, right_latitude, right_longitude):
+        return None
+    earth_radius_km = 6371.0
+    lat1 = math.radians(float(left_latitude))
+    lat2 = math.radians(float(right_latitude))
+    delta_lat = math.radians(float(right_latitude) - float(left_latitude))
+    delta_lon = math.radians(float(right_longitude) - float(left_longitude))
+    a = math.sin(delta_lat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2) ** 2
+    return earth_radius_km * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 def _embedding_to_pgvector(vector: list[float]) -> str:
@@ -100,12 +119,25 @@ class SqliteRestaurantStore:
                 CREATE INDEX IF NOT EXISTS idx_restaurant_notes_restaurant_id
                     ON restaurant_notes(restaurant_id);
 
+                CREATE TABLE IF NOT EXISTS taste_agent_sessions (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT,
+                    title TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_taste_agent_sessions_user_id
+                    ON taste_agent_sessions(user_id);
+
                 CREATE TABLE IF NOT EXISTS taste_agent_messages (
                     id TEXT PRIMARY KEY,
+                    session_id TEXT REFERENCES taste_agent_sessions(id) ON DELETE CASCADE,
                     user_id TEXT,
                     role TEXT NOT NULL,
                     content TEXT NOT NULL,
                     retrieved_context_json TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
@@ -131,6 +163,8 @@ class SqliteRestaurantStore:
             for statement in (
                 "ALTER TABLE restaurants ADD COLUMN latitude REAL",
                 "ALTER TABLE restaurants ADD COLUMN longitude REAL",
+                "ALTER TABLE taste_agent_messages ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
+                "ALTER TABLE taste_agent_messages ADD COLUMN session_id TEXT REFERENCES taste_agent_sessions(id) ON DELETE CASCADE",
             ):
                 try:
                     connection.execute(statement)
@@ -329,6 +363,51 @@ class SqliteRestaurantStore:
             ).fetchone()
         return self._restaurant_from_row(row) if row else None
 
+    def update_restaurant(self, restaurant_id: str, payload: RestaurantUpdate) -> RestaurantResponse | None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE restaurants
+                SET name = ?,
+                    area = ?,
+                    cuisine = ?,
+                    price_level = ?,
+                    mood_tags_json = ?,
+                    kakao_place_id = ?,
+                    kakao_place_url = ?,
+                    address = ?,
+                    road_address = ?,
+                    phone = ?,
+                    latitude = ?,
+                    longitude = ?
+                WHERE id = ?
+                """,
+                (
+                    payload.name,
+                    payload.area,
+                    payload.cuisine,
+                    payload.price_level,
+                    json.dumps(payload.mood_tags, ensure_ascii=False),
+                    payload.kakao_place_id,
+                    payload.kakao_place_url,
+                    payload.address,
+                    payload.road_address,
+                    payload.phone,
+                    payload.latitude,
+                    payload.longitude,
+                    restaurant_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                return None
+        return self.get_restaurant(restaurant_id)
+
+    def delete_restaurant(self, restaurant_id: str) -> bool:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM restaurant_notes WHERE restaurant_id = ?", (restaurant_id,))
+            cursor = connection.execute("DELETE FROM restaurants WHERE id = ?", (restaurant_id,))
+            return cursor.rowcount > 0
+
     def recommend(
         self,
         query: str,
@@ -337,6 +416,8 @@ class SqliteRestaurantStore:
         cuisine: str | None,
         price_level: str | None,
         tags: list[str],
+        latitude: float | None,
+        longitude: float | None,
         limit: int,
     ) -> list[RestaurantRecommendation]:
         query_embedding = _embed(" ".join([query, area or "", cuisine or "", price_level or "", " ".join(tags)]))
@@ -349,16 +430,21 @@ class SqliteRestaurantStore:
             vector_score = _cosine(json.loads(row["embedding_json"]), query_embedding)
             tag_score = 0.08 * len(normalized_terms & (note_tags | restaurant_tags))
             keyword_score = 0.05 if any(term and term in row["content"].lower() for term in normalized_terms) else 0.0
-            score = vector_score + tag_score + keyword_score
+            distance = _distance_km(latitude, longitude, row["latitude"], row["longitude"])
+            distance_score = 0.0 if distance is None else max(0.0, 0.18 - min(distance, 10.0) * 0.018)
+            score = vector_score + tag_score + keyword_score + distance_score
             bucket = scored.setdefault(
                 row["id"],
                 {
                     "restaurant": self._restaurant_from_row(row),
                     "score": 0.0,
                     "evidence": [],
+                    "distance_km": distance,
                 },
             )
             bucket["score"] = max(bucket["score"], score)
+            if distance is not None:
+                bucket["distance_km"] = distance
             if len(bucket["evidence"]) < 2:
                 bucket["evidence"].append(row["content"])
         ranked = sorted(scored.values(), key=lambda item: item["score"], reverse=True)
@@ -400,24 +486,34 @@ class SqliteRestaurantStore:
 
     def save_message(
         self,
+        session_id: str,
         user_id: str | None,
         role: str,
         content: str,
         retrieved_context: list[str],
+        metadata: dict[str, Any] | None = None,
     ) -> TasteAgentMessage:
         message_id = str(uuid4())
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO taste_agent_messages
-                    (id, user_id, role, content, retrieved_context_json)
-                VALUES (?, ?, ?, ?, ?)
+                    (id, session_id, user_id, role, content, retrieved_context_json, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (message_id, user_id, role, content, json.dumps(retrieved_context, ensure_ascii=False)),
+                (
+                    message_id,
+                    session_id,
+                    user_id,
+                    role,
+                    content,
+                    json.dumps(retrieved_context, ensure_ascii=False),
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                ),
             )
             row = connection.execute(
                 """
-                SELECT id, user_id, role, content, retrieved_context_json, created_at
+                SELECT id, session_id, user_id, role, content, retrieved_context_json, metadata_json, created_at
                 FROM taste_agent_messages
                 WHERE id = ?
                 """,
@@ -425,13 +521,52 @@ class SqliteRestaurantStore:
             ).fetchone()
         return self._message_from_row(row)
 
+    def create_chat_session(self, user_id: str | None, title: str) -> TasteAgentSession:
+        session_id = str(uuid4())
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO taste_agent_sessions (id, user_id, title)
+                VALUES (?, ?, ?)
+                """,
+                (session_id, user_id, title[:80] or "새 대화"),
+            )
+        return TasteAgentSession(
+            id=session_id,
+            user_id=user_id,
+            title=title[:80] or "새 대화",
+            created_at="",
+            updated_at="",
+            messages=[],
+        )
+
+    def ensure_chat_session(self, user_id: str | None, session_id: str | None, title: str) -> str:
+        if session_id:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT id FROM taste_agent_sessions WHERE id = ? AND user_id = ?",
+                    (session_id, user_id),
+                ).fetchone()
+            if row:
+                return str(row["id"])
+
+        session = self.create_chat_session(user_id, title)
+        return session.id
+
+    def touch_chat_session(self, session_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE taste_agent_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (session_id,),
+            )
+
     def list_messages(self, user_id: str | None) -> list[TasteAgentMessage]:
         where_clause = "WHERE user_id = ?" if user_id else ""
         params = (user_id,) if user_id else ()
         with self._connect() as connection:
             rows = connection.execute(
                 f"""
-                SELECT id, user_id, role, content, retrieved_context_json, created_at
+                SELECT id, session_id, user_id, role, content, retrieved_context_json, metadata_json, created_at
                 FROM taste_agent_messages
                 {where_clause}
                 ORDER BY created_at ASC
@@ -439,6 +574,51 @@ class SqliteRestaurantStore:
                 params,
             ).fetchall()
         return [self._message_from_row(row) for row in rows]
+
+    def list_sessions(self, user_id: str | None) -> list[TasteAgentSession]:
+        messages = self.list_messages(user_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, user_id, title, created_at, updated_at
+                FROM taste_agent_sessions
+                WHERE user_id = ?
+                ORDER BY updated_at DESC
+                """,
+                (user_id,),
+            ).fetchall()
+
+        grouped: dict[str, list[TasteAgentMessage]] = {}
+        legacy_messages: list[TasteAgentMessage] = []
+        for message in messages:
+            if message.session_id:
+                grouped.setdefault(message.session_id, []).append(message)
+            else:
+                legacy_messages.append(message)
+
+        sessions = [
+            TasteAgentSession(
+                id=row["id"],
+                user_id=row["user_id"],
+                title=row["title"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+                messages=grouped.get(row["id"], []),
+            )
+            for row in rows
+        ]
+        if legacy_messages:
+            sessions.append(
+                TasteAgentSession(
+                    id="legacy",
+                    user_id=user_id,
+                    title="이전 대화 기록",
+                    created_at=legacy_messages[0].created_at,
+                    updated_at=legacy_messages[-1].created_at,
+                    messages=legacy_messages,
+                )
+            )
+        return sessions
 
     def _restaurant_from_row(self, row: Any) -> RestaurantResponse:
         return RestaurantResponse(
@@ -464,12 +644,14 @@ class SqliteRestaurantStore:
     def _recommendation_from_bucket(self, bucket: dict[str, Any]) -> RestaurantRecommendation:
         restaurant: RestaurantResponse = bucket["restaurant"]
         evidence = bucket["evidence"]
-        menu_text = ", ".join(restaurant.signature_menus[:2]) if restaurant.signature_menus else "저장된 메모 기준으로 대표 메뉴를 확인해보세요."
+        review_point = evidence[0] if evidence else "저장된 리뷰를 기준으로 분위기와 취향을 확인해보세요."
+        distance = bucket.get("distance_km")
+        location_hint = f" 현재 위치에서 약 {distance:.1f}km 거리입니다." if distance is not None else ""
         return RestaurantRecommendation(
             restaurant=restaurant,
-            reason=f"{restaurant.area}에서 {restaurant.cuisine} 분위기와 요청 조건이 잘 맞는 후보입니다.",
+            reason=f"{restaurant.area}에서 {restaurant.cuisine} 분위기와 요청 조건이 잘 맞는 후보입니다.{location_hint}",
             evidence=evidence,
-            menu_tip=f"추천 메뉴: {menu_text}",
+            menu_tip=f"추천 포인트: {review_point}",
             caution="영업시간, 웨이팅, 휴무는 방문 전에 카카오 장소 링크나 매장 공지를 확인하세요.",
             score=round(float(bucket["score"]), 4),
         )
@@ -477,10 +659,12 @@ class SqliteRestaurantStore:
     def _message_from_row(self, row: Any) -> TasteAgentMessage:
         return TasteAgentMessage(
             id=row["id"],
+            session_id=row["session_id"] if "session_id" in row.keys() else None,
             user_id=row["user_id"],
             role=row["role"],
             content=row["content"],
             retrieved_context=json.loads(row["retrieved_context_json"]),
+            metadata=json.loads(row["metadata_json"] or "{}"),
             created_at=row["created_at"],
         )
 
@@ -543,17 +727,33 @@ class PgRestaurantStore(SqliteRestaurantStore):
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_restaurant_notes_restaurant_id ON restaurant_notes(restaurant_id)")
                 cursor.execute(
                     """
+                    CREATE TABLE IF NOT EXISTS taste_agent_sessions (
+                        id TEXT PRIMARY KEY,
+                        user_id TEXT,
+                        title TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_taste_agent_sessions_user_id ON taste_agent_sessions(user_id)")
+                cursor.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS taste_agent_messages (
                         id TEXT PRIMARY KEY,
+                        session_id TEXT REFERENCES taste_agent_sessions(id) ON DELETE CASCADE,
                         user_id TEXT,
                         role TEXT NOT NULL,
                         content TEXT NOT NULL,
                         retrieved_context_json TEXT NOT NULL,
+                        metadata_json TEXT NOT NULL DEFAULT '{}',
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     )
                     """
                 )
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_taste_agent_messages_user_id ON taste_agent_messages(user_id)")
+                cursor.execute("ALTER TABLE taste_agent_messages ADD COLUMN IF NOT EXISTS metadata_json TEXT NOT NULL DEFAULT '{}'")
+                cursor.execute("ALTER TABLE taste_agent_messages ADD COLUMN IF NOT EXISTS session_id TEXT REFERENCES taste_agent_sessions(id) ON DELETE CASCADE")
                 cursor.execute(
                     """
                     CREATE TABLE IF NOT EXISTS users (
@@ -794,6 +994,55 @@ class PgRestaurantStore(SqliteRestaurantStore):
                 row = cursor.fetchone()
         return self._restaurant_from_row(row) if row else None
 
+    def update_restaurant(self, restaurant_id: str, payload: RestaurantUpdate) -> RestaurantResponse | None:
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE restaurants
+                    SET name = %s,
+                        area = %s,
+                        cuisine = %s,
+                        price_level = %s,
+                        mood_tags_json = %s,
+                        kakao_place_id = %s,
+                        kakao_place_url = %s,
+                        address = %s,
+                        road_address = %s,
+                        phone = %s,
+                        latitude = %s,
+                        longitude = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        payload.name,
+                        payload.area,
+                        payload.cuisine,
+                        payload.price_level,
+                        json.dumps(payload.mood_tags, ensure_ascii=False),
+                        payload.kakao_place_id,
+                        payload.kakao_place_url,
+                        payload.address,
+                        payload.road_address,
+                        payload.phone,
+                        payload.latitude,
+                        payload.longitude,
+                        restaurant_id,
+                    ),
+                )
+                updated = cursor.rowcount > 0
+            connection.commit()
+        return self.get_restaurant(restaurant_id) if updated else None
+
+    def delete_restaurant(self, restaurant_id: str) -> bool:
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("DELETE FROM restaurant_notes WHERE restaurant_id = %s", (restaurant_id,))
+                cursor.execute("DELETE FROM restaurants WHERE id = %s", (restaurant_id,))
+                deleted = cursor.rowcount > 0
+            connection.commit()
+        return deleted
+
     def _search_note_rows(
         self,
         user_id: str | None,
@@ -834,10 +1083,12 @@ class PgRestaurantStore(SqliteRestaurantStore):
 
     def save_message(
         self,
+        session_id: str,
         user_id: str | None,
         role: str,
         content: str,
         retrieved_context: list[str],
+        metadata: dict[str, Any] | None = None,
     ) -> TasteAgentMessage:
         message_id = str(uuid4())
         with self._connect() as connection:
@@ -845,14 +1096,22 @@ class PgRestaurantStore(SqliteRestaurantStore):
                 cursor.execute(
                     """
                     INSERT INTO taste_agent_messages
-                        (id, user_id, role, content, retrieved_context_json)
-                    VALUES (%s, %s, %s, %s, %s)
+                        (id, session_id, user_id, role, content, retrieved_context_json, metadata_json)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     """,
-                    (message_id, user_id, role, content, json.dumps(retrieved_context, ensure_ascii=False)),
+                    (
+                        message_id,
+                        session_id,
+                        user_id,
+                        role,
+                        content,
+                        json.dumps(retrieved_context, ensure_ascii=False),
+                        json.dumps(metadata or {}, ensure_ascii=False),
+                    ),
                 )
                 cursor.execute(
                     """
-                    SELECT id, user_id, role, content, retrieved_context_json,
+                    SELECT id, session_id, user_id, role, content, retrieved_context_json, metadata_json,
                         created_at::text AS created_at
                     FROM taste_agent_messages
                     WHERE id = %s
@@ -862,6 +1121,52 @@ class PgRestaurantStore(SqliteRestaurantStore):
                 row = cursor.fetchone()
         return self._message_from_row(row)
 
+    def create_chat_session(self, user_id: str | None, title: str) -> TasteAgentSession:
+        session_id = str(uuid4())
+        session_title = title[:80] or "새 대화"
+        with self._connect() as connection:
+            with connection.cursor(row_factory=self.dict_row) as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO taste_agent_sessions (id, user_id, title)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (session_id, user_id, session_title),
+                )
+                connection.commit()
+                cursor.execute(
+                    """
+                    SELECT id, user_id, title, created_at::text AS created_at, updated_at::text AS updated_at
+                    FROM taste_agent_sessions
+                    WHERE id = %s
+                    """,
+                    (session_id,),
+                )
+                row = cursor.fetchone()
+        return TasteAgentSession(**row, messages=[])
+
+    def ensure_chat_session(self, user_id: str | None, session_id: str | None, title: str) -> str:
+        if session_id:
+            with self._connect() as connection:
+                with connection.cursor(row_factory=self.dict_row) as cursor:
+                    cursor.execute(
+                        "SELECT id FROM taste_agent_sessions WHERE id = %s AND user_id = %s",
+                        (session_id, user_id),
+                    )
+                    row = cursor.fetchone()
+            if row:
+                return str(row["id"])
+        return self.create_chat_session(user_id, title).id
+
+    def touch_chat_session(self, session_id: str) -> None:
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE taste_agent_sessions SET updated_at = NOW() WHERE id = %s",
+                    (session_id,),
+                )
+            connection.commit()
+
     def list_messages(self, user_id: str | None) -> list[TasteAgentMessage]:
         where_clause = "WHERE user_id = %s" if user_id else ""
         params = (user_id,) if user_id else ()
@@ -869,7 +1174,7 @@ class PgRestaurantStore(SqliteRestaurantStore):
             with connection.cursor(row_factory=self.dict_row) as cursor:
                 cursor.execute(
                     f"""
-                    SELECT id, user_id, role, content, retrieved_context_json,
+                    SELECT id, session_id, user_id, role, content, retrieved_context_json, metadata_json,
                         created_at::text AS created_at
                     FROM taste_agent_messages
                     {where_clause}
@@ -879,6 +1184,53 @@ class PgRestaurantStore(SqliteRestaurantStore):
                 )
                 rows = cursor.fetchall()
         return [self._message_from_row(row) for row in rows]
+
+    def list_sessions(self, user_id: str | None) -> list[TasteAgentSession]:
+        messages = self.list_messages(user_id)
+        with self._connect() as connection:
+            with connection.cursor(row_factory=self.dict_row) as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, user_id, title, created_at::text AS created_at, updated_at::text AS updated_at
+                    FROM taste_agent_sessions
+                    WHERE user_id = %s
+                    ORDER BY updated_at DESC
+                    """,
+                    (user_id,),
+                )
+                rows = cursor.fetchall()
+
+        grouped: dict[str, list[TasteAgentMessage]] = {}
+        legacy_messages: list[TasteAgentMessage] = []
+        for message in messages:
+            if message.session_id:
+                grouped.setdefault(message.session_id, []).append(message)
+            else:
+                legacy_messages.append(message)
+
+        sessions = [
+            TasteAgentSession(
+                id=row["id"],
+                user_id=row["user_id"],
+                title=row["title"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+                messages=grouped.get(row["id"], []),
+            )
+            for row in rows
+        ]
+        if legacy_messages:
+            sessions.append(
+                TasteAgentSession(
+                    id="legacy",
+                    user_id=user_id,
+                    title="이전 대화 기록",
+                    created_at=legacy_messages[0].created_at,
+                    updated_at=legacy_messages[-1].created_at,
+                    messages=legacy_messages,
+                )
+            )
+        return sessions
 
 
 class RestaurantStore:
@@ -934,6 +1286,12 @@ class RestaurantStore:
     def get_restaurant(self, restaurant_id: str) -> RestaurantResponse | None:
         return self.backend.get_restaurant(restaurant_id)
 
+    def update_restaurant(self, restaurant_id: str, payload: RestaurantUpdate) -> RestaurantResponse | None:
+        return self.backend.update_restaurant(restaurant_id, payload)
+
+    def delete_restaurant(self, restaurant_id: str) -> bool:
+        return self.backend.delete_restaurant(restaurant_id)
+
     def recommend(
         self,
         query: str,
@@ -942,21 +1300,34 @@ class RestaurantStore:
         cuisine: str | None,
         price_level: str | None,
         tags: list[str],
+        latitude: float | None,
+        longitude: float | None,
         limit: int,
     ) -> list[RestaurantRecommendation]:
-        return self.backend.recommend(query, user_id, area, cuisine, price_level, tags, limit)
+        return self.backend.recommend(query, user_id, area, cuisine, price_level, tags, latitude, longitude, limit)
 
     def save_message(
         self,
+        session_id: str,
         user_id: str | None,
         role: str,
         content: str,
         retrieved_context: list[str],
+        metadata: dict[str, Any] | None = None,
     ) -> TasteAgentMessage:
-        return self.backend.save_message(user_id, role, content, retrieved_context)
+        return self.backend.save_message(session_id, user_id, role, content, retrieved_context, metadata)
 
     def list_messages(self, user_id: str | None) -> list[TasteAgentMessage]:
         return self.backend.list_messages(user_id)
+
+    def ensure_chat_session(self, user_id: str | None, session_id: str | None, title: str) -> str:
+        return self.backend.ensure_chat_session(user_id, session_id, title)
+
+    def touch_chat_session(self, session_id: str) -> None:
+        self.backend.touch_chat_session(session_id)
+
+    def list_sessions(self, user_id: str | None) -> list[TasteAgentSession]:
+        return self.backend.list_sessions(user_id)
 
 
 restaurant_store = RestaurantStore()
