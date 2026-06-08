@@ -7,16 +7,13 @@ APP_ENV = os.getenv("APP_ENV", "dev")
 
 
 class Settings(BaseSettings):
-    app_name: str = "ClipForge AI"
+    app_name: str = "TasteForge AI"
     app_env: str = "dev"
-    database_url: str = "sqlite:///./data/clipforge.db"
-    hf_api_token: str | None = None
-    hf_text_model: str = "Qwen/Qwen2.5-7B-Instruct"
-    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
-    use_hf_generation: bool = False
+    database_url: str = "sqlite:///./data/tasteforge.db"
     frontend_url: str = "http://localhost:5173"
     kakao_client_id: str | None = None
     kakao_client_secret: str | None = None
+    kakao_local_rest_api_key: str | None = None
     kakao_redirect_uri: str = "http://localhost:8000/api/auth/kakao/callback"
     jwt_secret_key: str | None = None
 
