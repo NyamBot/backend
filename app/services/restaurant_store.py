@@ -50,7 +50,7 @@ class SqliteRestaurantStore:
     def __init__(self, database_url: str) -> None:
         if not database_url.startswith("sqlite:///"):
             raise ValueError("SQLite URL must start with sqlite:///")
-        database_path = Path(database_url.removeprefix("sqlite:///"))
+        database_path = Path(database_url.removeprefix("sqlite:///")).resolve()
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self.database_path = database_path
         self._init_schema()
@@ -78,6 +78,8 @@ class SqliteRestaurantStore:
                     address TEXT,
                     road_address TEXT,
                     phone TEXT,
+                    latitude REAL,
+                    longitude REAL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
@@ -126,6 +128,14 @@ class SqliteRestaurantStore:
                     WHERE provider_subject IS NOT NULL;
                 """
             )
+            for statement in (
+                "ALTER TABLE restaurants ADD COLUMN latitude REAL",
+                "ALTER TABLE restaurants ADD COLUMN longitude REAL",
+            ):
+                try:
+                    connection.execute(statement)
+                except sqlite3.OperationalError:
+                    pass
 
     def create_user(
         self,
@@ -148,6 +158,32 @@ class SqliteRestaurantStore:
         user = self.get_user(user_id)
         if user is None:
             raise RuntimeError("Created user could not be loaded")
+        return user
+
+    def upsert_user(
+        self,
+        email: str,
+        display_name: str,
+        avatar_url: str | None,
+        auth_provider: str,
+        provider_subject: str,
+    ) -> dict[str, Any]:
+        existing = self.get_user_by_provider(auth_provider, provider_subject)
+        if existing is None:
+            return self.create_user(email, display_name, avatar_url, auth_provider, provider_subject)
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE users
+                SET email = ?, display_name = ?, avatar_url = ?, last_login_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (email, display_name, avatar_url, existing["id"]),
+            )
+        user = self.get_user(existing["id"])
+        if user is None:
+            raise RuntimeError("Updated user could not be loaded")
         return user
 
     def list_users(self) -> list[dict[str, Any]]:
@@ -175,6 +211,19 @@ class SqliteRestaurantStore:
             ).fetchone()
         return dict(row) if row else None
 
+    def get_user_by_provider(self, auth_provider: str, provider_subject: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, email, display_name, avatar_url, auth_provider,
+                    provider_subject, created_at, last_login_at
+                FROM users
+                WHERE auth_provider = ? AND provider_subject = ?
+                """,
+                (auth_provider, provider_subject),
+            ).fetchone()
+        return dict(row) if row else None
+
     def create_restaurant(self, payload: RestaurantCreate) -> RestaurantResponse:
         restaurant_id = str(uuid4())
         note_id = str(uuid4())
@@ -185,9 +234,9 @@ class SqliteRestaurantStore:
                 INSERT INTO restaurants (
                     id, user_id, name, area, cuisine, price_level, mood_tags_json,
                     signature_menus_json, kakao_place_id, kakao_place_url,
-                    address, road_address, phone
+                    address, road_address, phone, latitude, longitude
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     restaurant_id,
@@ -203,6 +252,8 @@ class SqliteRestaurantStore:
                     payload.address,
                     payload.road_address,
                     payload.phone,
+                    payload.latitude,
+                    payload.longitude,
                 ),
             )
             connection.execute(
@@ -404,6 +455,8 @@ class SqliteRestaurantStore:
             address=row["address"],
             road_address=row["road_address"],
             phone=row["phone"],
+            latitude=row["latitude"],
+            longitude=row["longitude"],
             note_count=int(row["note_count"]),
             created_at=row["created_at"],
         )
@@ -465,10 +518,14 @@ class PgRestaurantStore(SqliteRestaurantStore):
                         address TEXT,
                         road_address TEXT,
                         phone TEXT,
+                        latitude DOUBLE PRECISION,
+                        longitude DOUBLE PRECISION,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     )
                     """
                 )
+                cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION")
+                cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_restaurants_user_id ON restaurants(user_id)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_restaurants_area ON restaurants(area)")
                 cursor.execute(
@@ -540,9 +597,9 @@ class PgRestaurantStore(SqliteRestaurantStore):
                     INSERT INTO restaurants (
                         id, user_id, name, area, cuisine, price_level, mood_tags_json,
                         signature_menus_json, kakao_place_id, kakao_place_url,
-                        address, road_address, phone
+                        address, road_address, phone, latitude, longitude
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         restaurant_id,
@@ -558,6 +615,8 @@ class PgRestaurantStore(SqliteRestaurantStore):
                         payload.address,
                         payload.road_address,
                         payload.phone,
+                        payload.latitude,
+                        payload.longitude,
                     ),
                 )
                 cursor.execute(
@@ -627,6 +686,33 @@ class PgRestaurantStore(SqliteRestaurantStore):
             raise RuntimeError("Created user could not be loaded")
         return user
 
+    def upsert_user(
+        self,
+        email: str,
+        display_name: str,
+        avatar_url: str | None,
+        auth_provider: str,
+        provider_subject: str,
+    ) -> dict[str, Any]:
+        existing = self.get_user_by_provider(auth_provider, provider_subject)
+        if existing is None:
+            return self.create_user(email, display_name, avatar_url, auth_provider, provider_subject)
+
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE users
+                    SET email = %s, display_name = %s, avatar_url = %s, last_login_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (email, display_name, avatar_url, existing["id"]),
+                )
+        user = self.get_user(existing["id"])
+        if user is None:
+            raise RuntimeError("Updated user could not be loaded")
+        return user
+
     def list_users(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
             with connection.cursor(row_factory=self.dict_row) as cursor:
@@ -653,6 +739,21 @@ class PgRestaurantStore(SqliteRestaurantStore):
                     WHERE id = %s
                     """,
                     (user_id,),
+                )
+                return cursor.fetchone()
+
+    def get_user_by_provider(self, auth_provider: str, provider_subject: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            with connection.cursor(row_factory=self.dict_row) as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, email, display_name, avatar_url, auth_provider,
+                        provider_subject, created_at::text AS created_at,
+                        last_login_at::text AS last_login_at
+                    FROM users
+                    WHERE auth_provider = %s AND provider_subject = %s
+                    """,
+                    (auth_provider, provider_subject),
                 )
                 return cursor.fetchone()
 
@@ -790,7 +891,7 @@ class RestaurantStore:
             else:
                 raise ValueError("Unsupported DATABASE_URL")
         except Exception:
-            self.backend = SqliteRestaurantStore("sqlite:///./data/tasteforge.db")
+            self.backend = SqliteRestaurantStore("sqlite:///./data/nyambot.db")
 
     def create_restaurant(self, payload: RestaurantCreate) -> RestaurantResponse:
         return self.backend.create_restaurant(payload)
@@ -808,11 +909,24 @@ class RestaurantStore:
     ) -> dict[str, Any]:
         return self.backend.create_user(email, display_name, avatar_url, auth_provider, provider_subject)
 
+    def upsert_user(
+        self,
+        email: str,
+        display_name: str,
+        avatar_url: str | None,
+        auth_provider: str,
+        provider_subject: str,
+    ) -> dict[str, Any]:
+        return self.backend.upsert_user(email, display_name, avatar_url, auth_provider, provider_subject)
+
     def list_users(self) -> list[dict[str, Any]]:
         return self.backend.list_users()
 
     def get_user(self, user_id: str) -> dict[str, Any] | None:
         return self.backend.get_user(user_id)
+
+    def get_user_by_provider(self, auth_provider: str, provider_subject: str) -> dict[str, Any] | None:
+        return self.backend.get_user_by_provider(auth_provider, provider_subject)
 
     def list_restaurants(self, user_id: str | None = None) -> list[RestaurantResponse]:
         return self.backend.list_restaurants(user_id)

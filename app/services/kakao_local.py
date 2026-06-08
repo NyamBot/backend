@@ -17,9 +17,9 @@ class KakaoLocalApiError(Exception):
 
 
 def search_places(query: str, size: int = 5) -> list[KakaoPlace]:
-    api_key = settings.kakao_local_rest_api_key or settings.kakao_client_id
+    api_key = get_kakao_local_api_key()
     if not api_key:
-        return []
+        raise KakaoLocalApiError(400, "KAKAO_LOCAL_REST_API_KEY is not configured")
 
     try:
         response = httpx.get(
@@ -49,6 +49,10 @@ def search_places(query: str, size: int = 5) -> list[KakaoPlace]:
         )
         for document in response.json().get("documents", [])
     ]
+
+
+def get_kakao_local_api_key() -> str | None:
+    return settings.kakao_local_rest_api_key or settings.kakao_client_id
 
 
 def _extract_error_message(response: httpx.Response) -> str:

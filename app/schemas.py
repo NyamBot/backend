@@ -27,6 +27,21 @@ class UserResponse(BaseModel):
     last_login_at: str | None
 
 
+class AuthCallbackResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
+
+class AuthCodeExchangeRequest(BaseModel):
+    code: str = Field(min_length=1)
+
+
+class AuthTokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
 class RestaurantCreate(BaseModel):
     user_id: str | None = None
     name: str = Field(min_length=1, max_length=120)
@@ -41,6 +56,8 @@ class RestaurantCreate(BaseModel):
     address: str | None = None
     road_address: str | None = None
     phone: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
 
 
 class RestaurantNoteCreate(BaseModel):
@@ -65,6 +82,15 @@ class KakaoPlaceSearchResponse(BaseModel):
     places: list[KakaoPlace]
 
 
+class KakaoLocalValidationResponse(BaseModel):
+    configured: bool
+    query: str
+    success: bool
+    status_code: int | None = None
+    place_count: int = 0
+    message: str
+
+
 class RestaurantResponse(BaseModel):
     id: str
     user_id: str | None
@@ -79,6 +105,8 @@ class RestaurantResponse(BaseModel):
     address: str | None
     road_address: str | None
     phone: str | None
+    latitude: float | None
+    longitude: float | None
     note_count: int
     created_at: str
 
