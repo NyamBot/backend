@@ -9,7 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from app.core.config import settings
-from app.schemas import ClipIdea, ScriptPack
+from app.schemas import AgentMessage, ClipIdea, ScriptPack
 from app.services.chunker import chunk_text
 
 
@@ -139,6 +139,18 @@ class SqliteVectorStore:
 
                 CREATE INDEX IF NOT EXISTS idx_campaign_packs_clip_idea_id
                     ON campaign_packs(clip_idea_id);
+
+                CREATE TABLE IF NOT EXISTS agent_messages (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    retrieved_context_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_agent_messages_source_id
+                    ON agent_messages(source_id);
                 """
             )
             self._ensure_sqlite_column(connection, "sources", "user_id", "TEXT REFERENCES users(id) ON DELETE SET NULL")
@@ -311,6 +323,69 @@ class SqliteVectorStore:
             reverse=True,
         )
         return [row["document"] for row in ranked[:limit]]
+
+    def save_agent_message(
+        self,
+        source_id: str,
+        role: str,
+        content: str,
+        retrieved_context: list[str],
+    ) -> AgentMessage:
+        message_id = str(uuid4())
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO agent_messages
+                    (id, source_id, role, content, retrieved_context_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    source_id,
+                    role,
+                    content,
+                    json.dumps(retrieved_context, ensure_ascii=False),
+                ),
+            )
+        saved = self.get_agent_message(message_id)
+        if saved is None:
+            raise RuntimeError("Created agent message could not be loaded")
+        return saved
+
+    def list_agent_messages(self, source_id: str) -> list[AgentMessage]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, source_id, role, content, retrieved_context_json, created_at
+                FROM agent_messages
+                WHERE source_id = ?
+                ORDER BY created_at ASC
+                """,
+                (source_id,),
+            ).fetchall()
+        return [self._agent_message_from_row(row) for row in rows]
+
+    def get_agent_message(self, message_id: str) -> AgentMessage | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, source_id, role, content, retrieved_context_json, created_at
+                FROM agent_messages
+                WHERE id = ?
+                """,
+                (message_id,),
+            ).fetchone()
+        return self._agent_message_from_row(row) if row else None
+
+    def _agent_message_from_row(self, row: sqlite3.Row) -> AgentMessage:
+        return AgentMessage(
+            id=row["id"],
+            source_id=row["source_id"],
+            role=row["role"],
+            content=row["content"],
+            retrieved_context=json.loads(row["retrieved_context_json"]),
+            created_at=row["created_at"],
+        )
 
     def save_clip_ideas(self, source_id: str, ideas: list[ClipIdea]) -> list[ClipIdea]:
         with self._connect() as connection:
@@ -585,6 +660,24 @@ class PgVectorStore:
                         ON campaign_packs(clip_idea_id)
                     """
                 )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS agent_messages (
+                        id TEXT PRIMARY KEY,
+                        source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                        role TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        retrieved_context_json TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_agent_messages_source_id
+                        ON agent_messages(source_id)
+                    """
+                )
                 self._ensure_pg_column(cursor, "sources", "user_id", "TEXT REFERENCES users(id) ON DELETE SET NULL")
                 self._ensure_pg_column(cursor, "sources", "goal", "TEXT NOT NULL DEFAULT 'awareness'")
                 connection.commit()
@@ -769,6 +862,76 @@ class PgVectorStore:
                     (source_id, query_embedding, limit),
                 )
                 return [row[0] for row in cursor.fetchall()]
+
+    def save_agent_message(
+        self,
+        source_id: str,
+        role: str,
+        content: str,
+        retrieved_context: list[str],
+    ) -> AgentMessage:
+        message_id = str(uuid4())
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO agent_messages
+                        (id, source_id, role, content, retrieved_context_json)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        message_id,
+                        source_id,
+                        role,
+                        content,
+                        json.dumps(retrieved_context, ensure_ascii=False),
+                    ),
+                )
+        saved = self.get_agent_message(message_id)
+        if saved is None:
+            raise RuntimeError("Created agent message could not be loaded")
+        return saved
+
+    def list_agent_messages(self, source_id: str) -> list[AgentMessage]:
+        with self._connect() as connection:
+            with connection.cursor(row_factory=self.dict_row) as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, source_id, role, content, retrieved_context_json,
+                        created_at::text AS created_at
+                    FROM agent_messages
+                    WHERE source_id = %s
+                    ORDER BY created_at ASC
+                    """,
+                    (source_id,),
+                )
+                rows = cursor.fetchall()
+        return [self._agent_message_from_row(row) for row in rows]
+
+    def get_agent_message(self, message_id: str) -> AgentMessage | None:
+        with self._connect() as connection:
+            with connection.cursor(row_factory=self.dict_row) as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, source_id, role, content, retrieved_context_json,
+                        created_at::text AS created_at
+                    FROM agent_messages
+                    WHERE id = %s
+                    """,
+                    (message_id,),
+                )
+                row = cursor.fetchone()
+        return self._agent_message_from_row(row) if row else None
+
+    def _agent_message_from_row(self, row: dict[str, Any]) -> AgentMessage:
+        return AgentMessage(
+            id=row["id"],
+            source_id=row["source_id"],
+            role=row["role"],
+            content=row["content"],
+            retrieved_context=json.loads(row["retrieved_context_json"]),
+            created_at=row["created_at"],
+        )
 
     def save_clip_ideas(self, source_id: str, ideas: list[ClipIdea]) -> list[ClipIdea]:
         with self._connect() as connection:
@@ -997,6 +1160,18 @@ class VectorStore:
 
     def search(self, source_id: str, query: str, limit: int = 5) -> list[str]:
         return self.backend.search(source_id, query, limit)
+
+    def save_agent_message(
+        self,
+        source_id: str,
+        role: str,
+        content: str,
+        retrieved_context: list[str],
+    ) -> AgentMessage:
+        return self.backend.save_agent_message(source_id, role, content, retrieved_context)
+
+    def list_agent_messages(self, source_id: str) -> list[AgentMessage]:
+        return self.backend.list_agent_messages(source_id)
 
     def save_clip_ideas(self, source_id: str, ideas: list[ClipIdea]) -> list[ClipIdea]:
         return self.backend.save_clip_ideas(source_id, ideas)

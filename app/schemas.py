@@ -108,3 +108,17 @@ class AgentChatRequest(BaseModel):
 class AgentChatResponse(BaseModel):
     answer: str
     context: list[str]
+
+
+class AgentMessage(BaseModel):
+    id: str
+    source_id: str
+    role: str
+    content: str
+    retrieved_context: list[str]
+    created_at: str
+
+
+class AgentMessagesResponse(BaseModel):
+    source_id: str
+    messages: list[AgentMessage]
