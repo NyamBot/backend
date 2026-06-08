@@ -2,10 +2,25 @@ from app.schemas import ClipIdea, ScriptPack
 from app.services.hf_generation import hf_generation
 
 
-def generate_clip_ideas(source_id: str, title: str, context: list[str], platform: str) -> list[ClipIdea]:
+def build_retrieval_query(platform: str, audience: str, goal: str) -> str:
+    return (
+        "strongest hook surprising insight common mistake useful lesson "
+        f"{platform} {audience} {goal} marketing CTA"
+    )
+
+
+def generate_clip_ideas(
+    source_id: str,
+    title: str,
+    context: list[str],
+    platform: str,
+    audience: str,
+    goal: str,
+    count: int = 3,
+) -> list[ClipIdea]:
     joined = " ".join(context)
     seed = joined[:180] if joined else title
-    return [
+    ideas = [
         ClipIdea(
             id=f"{source_id}-idea-1",
             title=f"{title}: the strongest 30-second hook",
@@ -14,6 +29,9 @@ def generate_clip_ideas(source_id: str, title: str, context: list[str], platform
             platform=platform,
             duration_seconds=35,
             hook_score=88,
+            audience_angle=f"For {audience}, frame this as the hidden reason the result changes.",
+            cta=_goal_cta(goal),
+            platform_fit=_platform_fit(platform, "fast contrast hook with one clear payoff"),
             source_moments=context[:2],
         ),
         ClipIdea(
@@ -24,6 +42,9 @@ def generate_clip_ideas(source_id: str, title: str, context: list[str], platform
             platform=platform,
             duration_seconds=45,
             hook_score=81,
+            audience_angle=f"For {audience}, make the useful lesson feel immediately applicable.",
+            cta=_goal_cta(goal),
+            platform_fit=_platform_fit(platform, "educational pacing with caption-first structure"),
             source_moments=context[1:3] or context[:1],
         ),
         ClipIdea(
@@ -34,9 +55,37 @@ def generate_clip_ideas(source_id: str, title: str, context: list[str], platform
             platform=platform,
             duration_seconds=40,
             hook_score=84,
+            audience_angle=f"For {audience}, turn the source into a practical mistake-to-fix story.",
+            cta=_goal_cta(goal),
+            platform_fit=_platform_fit(platform, "problem-solution structure with a saveable takeaway"),
             source_moments=context[2:4] or context[:1],
         ),
     ]
+    return ideas[:count]
+
+
+def _goal_cta(goal: str) -> str:
+    normalized = goal.lower()
+    if "conversion" in normalized or "lead" in normalized:
+        return "Use this as a soft CTA that asks viewers to try the next step."
+    if "education" in normalized:
+        return "Save this as a quick reference before applying the lesson."
+    if "awareness" in normalized:
+        return "Follow for more practical breakdowns from long-form source content."
+    return "Save this and use it before creating your next short-form asset."
+
+
+def _platform_fit(platform: str, reason: str) -> str:
+    normalized = platform.lower()
+    if "tiktok" in normalized:
+        return f"TikTok fit: {reason}; keep the first beat direct, visual, and casual."
+    if "reels" in normalized or "instagram" in normalized:
+        return f"Instagram Reels fit: {reason}; emphasize visual rhythm and concise captions."
+    if "linkedin" in normalized:
+        return f"LinkedIn fit: {reason}; keep the tone credible and insight-led."
+    if "shorts" in normalized or "youtube" in normalized:
+        return f"YouTube Shorts fit: {reason}; make the promise clear and retention-focused."
+    return f"Platform fit: {reason}."
 
 
 def generate_script_pack(idea: ClipIdea) -> ScriptPack:
