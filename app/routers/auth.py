@@ -13,7 +13,7 @@ from app.services.auth_exchange import auth_code_store
 from app.services.kakao_auth import KakaoAuthError, build_login_url, fetch_kakao_profile
 from app.services.restaurant_store import restaurant_store
 
-router = APIRouter(prefix="/api/auth", tags=["auth"])
+router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 @router.get("/kakao/login")

@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException
 from app.schemas import UserCreate, UserResponse
 from app.services.restaurant_store import restaurant_store
 
-router = APIRouter(prefix="/api/users", tags=["users"])
+router = APIRouter(prefix="/users", tags=["users"])
 
 
 @router.get("", response_model=list[UserResponse])

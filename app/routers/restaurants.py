@@ -26,7 +26,7 @@ from app.services.huggingface_chat import HuggingFaceChatError, huggingface_chat
 from app.services.kakao_local import KakaoLocalApiError, get_kakao_local_api_key, search_places
 from app.services.restaurant_store import restaurant_store
 
-router = APIRouter(prefix="/api/restaurants", tags=["restaurants"])
+router = APIRouter(prefix="/restaurants", tags=["restaurants"])
 
 NEARBY_RADIUS_METERS = 2000
 NEARBY_RADIUS_KM = NEARBY_RADIUS_METERS / 1000

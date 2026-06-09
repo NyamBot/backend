@@ -16,9 +16,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(auth.router)
-app.include_router(users.router)
-app.include_router(restaurants.router)
+app.include_router(auth.router, prefix=settings.api_prefix)
+app.include_router(users.router, prefix=settings.api_prefix)
+app.include_router(restaurants.router, prefix=settings.api_prefix)
 
 
 @app.get("/health", response_model=HealthResponse)
