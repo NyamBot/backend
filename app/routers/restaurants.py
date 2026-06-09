@@ -389,6 +389,7 @@ def chat(
         {
             "recommendation_count": len(recommendations),
             "restaurant_names": [recommendation.restaurant.name for recommendation in recommendations],
+            "recommendations": [recommendation.model_dump(mode="json") for recommendation in recommendations],
             "answer_provider": answer_provider,
             "ai_error": ai_error,
             "rerank_error": rerank_error,
@@ -521,7 +522,9 @@ def _recommendations_from_kakao_places(
     for index, place in enumerate(places[:limit], start=1):
         category_parts = [part.strip() for part in place.category_name.split(">") if part.strip()]
         cuisine_name = category_parts[-1] if category_parts else "맛집"
-        area = _extract_area(place.road_address_name or place.address_name)
+        address_text = place.road_address_name or place.address_name
+        area = _extract_area(address_text)
+        city, district, town = _extract_location_parts(address_text)
         latitude_value = _parse_float(place.y)
         longitude_value = _parse_float(place.x)
         distance = _distance_km(latitude, longitude, latitude_value, longitude_value)
@@ -531,6 +534,9 @@ def _recommendations_from_kakao_places(
             user_id=None,
             name=place.place_name,
             area=area,
+            city=city,
+            district=district,
+            town=town,
             cuisine=cuisine_name,
             price_level="",
             mood_tags=["근방 추천"],
@@ -726,9 +732,19 @@ def _normalize_nearby_query(query: str) -> str:
 
 def _extract_area(address: str) -> str:
     parts = address.split()
+    if len(parts) >= 3:
+        return " ".join(parts[:3])
     if len(parts) >= 2:
         return " ".join(parts[:2])
     return address or "근방"
+
+
+def _extract_location_parts(address: str) -> tuple[str | None, str | None, str | None]:
+    parts = address.split()
+    city = parts[0] if len(parts) >= 1 else None
+    district = parts[1] if len(parts) >= 2 else None
+    town = next((part for part in parts[2:] if re.search(r"(동|읍|면|리|가)$", part)), None)
+    return city, district, town
 
 
 def _parse_float(value: str) -> float | None:
@@ -817,6 +833,9 @@ def _build_fallback_recommendations(query: str, limit: int) -> list[RestaurantRe
             user_id=None,
             name=option["name"],
             area=option["area"],
+            city=None,
+            district=None,
+            town=None,
             cuisine=option["cuisine"],
             price_level=option["price_level"],
             mood_tags=option["mood_tags"],

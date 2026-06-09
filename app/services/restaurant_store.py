@@ -88,6 +88,9 @@ class SqliteRestaurantStore:
                     user_id TEXT,
                     name TEXT NOT NULL,
                     area TEXT NOT NULL,
+                    city TEXT,
+                    district TEXT,
+                    town TEXT,
                     cuisine TEXT NOT NULL,
                     price_level TEXT NOT NULL,
                     mood_tags_json TEXT NOT NULL,
@@ -163,6 +166,9 @@ class SqliteRestaurantStore:
             for statement in (
                 "ALTER TABLE restaurants ADD COLUMN latitude REAL",
                 "ALTER TABLE restaurants ADD COLUMN longitude REAL",
+                "ALTER TABLE restaurants ADD COLUMN city TEXT",
+                "ALTER TABLE restaurants ADD COLUMN district TEXT",
+                "ALTER TABLE restaurants ADD COLUMN town TEXT",
                 "ALTER TABLE taste_agent_messages ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
                 "ALTER TABLE taste_agent_messages ADD COLUMN session_id TEXT REFERENCES taste_agent_sessions(id) ON DELETE CASCADE",
             ):
@@ -266,17 +272,20 @@ class SqliteRestaurantStore:
             connection.execute(
                 """
                 INSERT INTO restaurants (
-                    id, user_id, name, area, cuisine, price_level, mood_tags_json,
+                    id, user_id, name, area, city, district, town, cuisine, price_level, mood_tags_json,
                     signature_menus_json, kakao_place_id, kakao_place_url,
                     address, road_address, phone, latitude, longitude
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     restaurant_id,
                     payload.user_id,
                     payload.name,
                     payload.area,
+                    payload.city,
+                    payload.district,
+                    payload.town,
                     payload.cuisine,
                     payload.price_level,
                     json.dumps(payload.mood_tags, ensure_ascii=False),
@@ -347,9 +356,16 @@ class SqliteRestaurantStore:
         for value in (city, district, town):
             if value:
                 clauses.append(
-                    "(restaurants.road_address LIKE ? OR restaurants.address LIKE ? OR restaurants.area LIKE ?)"
+                    """(
+                        restaurants.city LIKE ?
+                        OR restaurants.district LIKE ?
+                        OR restaurants.town LIKE ?
+                        OR restaurants.road_address LIKE ?
+                        OR restaurants.address LIKE ?
+                        OR restaurants.area LIKE ?
+                    )"""
                 )
-                params.extend([f"%{value}%", f"%{value}%", f"%{value}%"])
+                params.extend([f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%"])
         where_clause = "WHERE " + " AND ".join(clauses) if clauses else ""
         with self._connect() as connection:
             rows = connection.execute(
@@ -386,6 +402,9 @@ class SqliteRestaurantStore:
                 UPDATE restaurants
                 SET name = ?,
                     area = ?,
+                    city = ?,
+                    district = ?,
+                    town = ?,
                     cuisine = ?,
                     price_level = ?,
                     mood_tags_json = ?,
@@ -401,6 +420,9 @@ class SqliteRestaurantStore:
                 (
                     payload.name,
                     payload.area,
+                    payload.city,
+                    payload.district,
+                    payload.town,
                     payload.cuisine,
                     payload.price_level,
                     json.dumps(payload.mood_tags, ensure_ascii=False),
@@ -642,6 +664,9 @@ class SqliteRestaurantStore:
             user_id=row["user_id"],
             name=row["name"],
             area=row["area"],
+            city=row["city"],
+            district=row["district"],
+            town=row["town"],
             cuisine=row["cuisine"],
             price_level=row["price_level"],
             mood_tags=_json_list(row["mood_tags_json"]),
@@ -709,6 +734,9 @@ class PgRestaurantStore(SqliteRestaurantStore):
                         user_id TEXT,
                         name TEXT NOT NULL,
                         area TEXT NOT NULL,
+                        city TEXT,
+                        district TEXT,
+                        town TEXT,
                         cuisine TEXT NOT NULL,
                         price_level TEXT NOT NULL,
                         mood_tags_json TEXT NOT NULL,
@@ -726,6 +754,9 @@ class PgRestaurantStore(SqliteRestaurantStore):
                 )
                 cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION")
                 cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION")
+                cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS city TEXT")
+                cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS district TEXT")
+                cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS town TEXT")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_restaurants_user_id ON restaurants(user_id)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_restaurants_area ON restaurants(area)")
                 cursor.execute(
@@ -811,17 +842,20 @@ class PgRestaurantStore(SqliteRestaurantStore):
                 cursor.execute(
                     """
                     INSERT INTO restaurants (
-                        id, user_id, name, area, cuisine, price_level, mood_tags_json,
+                        id, user_id, name, area, city, district, town, cuisine, price_level, mood_tags_json,
                         signature_menus_json, kakao_place_id, kakao_place_url,
                         address, road_address, phone, latitude, longitude
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         restaurant_id,
                         payload.user_id,
                         payload.name,
                         payload.area,
+                        payload.city,
+                        payload.district,
+                        payload.town,
                         payload.cuisine,
                         payload.price_level,
                         json.dumps(payload.mood_tags, ensure_ascii=False),
@@ -988,9 +1022,16 @@ class PgRestaurantStore(SqliteRestaurantStore):
         for value in (city, district, town):
             if value:
                 clauses.append(
-                    "(restaurants.road_address ILIKE %s OR restaurants.address ILIKE %s OR restaurants.area ILIKE %s)"
+                    """(
+                        restaurants.city ILIKE %s
+                        OR restaurants.district ILIKE %s
+                        OR restaurants.town ILIKE %s
+                        OR restaurants.road_address ILIKE %s
+                        OR restaurants.address ILIKE %s
+                        OR restaurants.area ILIKE %s
+                    )"""
                 )
-                params.extend([f"%{value}%", f"%{value}%", f"%{value}%"])
+                params.extend([f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%"])
         where_clause = "WHERE " + " AND ".join(clauses) if clauses else ""
         with self._connect() as connection:
             with connection.cursor(row_factory=self.dict_row) as cursor:
@@ -1034,6 +1075,9 @@ class PgRestaurantStore(SqliteRestaurantStore):
                     UPDATE restaurants
                     SET name = %s,
                         area = %s,
+                        city = %s,
+                        district = %s,
+                        town = %s,
                         cuisine = %s,
                         price_level = %s,
                         mood_tags_json = %s,
@@ -1049,6 +1093,9 @@ class PgRestaurantStore(SqliteRestaurantStore):
                     (
                         payload.name,
                         payload.area,
+                        payload.city,
+                        payload.district,
+                        payload.town,
                         payload.cuisine,
                         payload.price_level,
                         json.dumps(payload.mood_tags, ensure_ascii=False),
