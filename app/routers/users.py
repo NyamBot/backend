@@ -1,5 +1,6 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from app.core.dependencies import get_current_user
 from app.schemas import UserCreate, UserResponse
 from app.services.restaurant_store import restaurant_store
 
@@ -29,3 +30,10 @@ def get_user(user_id: str) -> UserResponse:
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     return UserResponse(**user)
+
+
+@router.delete("/me", status_code=204)
+def delete_me(current_user: UserResponse = Depends(get_current_user)) -> None:
+    deleted = restaurant_store.delete_user(current_user.id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="User not found")

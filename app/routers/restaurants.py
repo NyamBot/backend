@@ -158,6 +158,8 @@ def list_restaurants(
     city: str | None = None,
     district: str | None = None,
     town: str | None = None,
+    query: str | None = None,
+    rating_level: str | None = None,
     current_user: UserResponse = Depends(get_current_user),
 ) -> list[RestaurantResponse]:
     return restaurant_store.list_restaurants(
@@ -165,6 +167,8 @@ def list_restaurants(
         city=city,
         district=district,
         town=town,
+        query=query,
+        rating_level=rating_level,
     )
 
 
@@ -548,6 +552,8 @@ def _recommendations_from_kakao_places(
             phone=place.phone or None,
             latitude=latitude_value,
             longitude=longitude_value,
+            image_url=None,
+            rating_level="중",
             note_count=0,
             created_at=created_at,
         )
@@ -847,6 +853,8 @@ def _build_fallback_recommendations(query: str, limit: int) -> list[RestaurantRe
             phone=None,
             latitude=None,
             longitude=None,
+            image_url=None,
+            rating_level="중",
             note_count=0,
             created_at=created_at,
         )
