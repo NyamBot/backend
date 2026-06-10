@@ -129,7 +129,6 @@ class SqliteRestaurantStore:
                     phone TEXT,
                     latitude REAL,
                     longitude REAL,
-                    image_url TEXT,
                     rating_level TEXT NOT NULL DEFAULT '맛남',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
@@ -198,7 +197,6 @@ class SqliteRestaurantStore:
                 "ALTER TABLE restaurants ADD COLUMN city TEXT",
                 "ALTER TABLE restaurants ADD COLUMN district TEXT",
                 "ALTER TABLE restaurants ADD COLUMN town TEXT",
-                "ALTER TABLE restaurants ADD COLUMN image_url TEXT",
                 "ALTER TABLE restaurants ADD COLUMN rating_level TEXT NOT NULL DEFAULT '맛남'",
                 "ALTER TABLE taste_agent_messages ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
                 "ALTER TABLE taste_agent_messages ADD COLUMN session_id TEXT REFERENCES taste_agent_sessions(id) ON DELETE CASCADE",
@@ -207,6 +205,10 @@ class SqliteRestaurantStore:
                     connection.execute(statement)
                 except sqlite3.OperationalError:
                     pass
+            try:
+                connection.execute("ALTER TABLE restaurants DROP COLUMN image_url")
+            except sqlite3.OperationalError:
+                pass
 
     def create_user(
         self,
@@ -320,9 +322,9 @@ class SqliteRestaurantStore:
                 INSERT INTO restaurants (
                     id, user_id, name, area, city, district, town, cuisine, price_level, mood_tags_json,
                     signature_menus_json, kakao_place_id, kakao_place_url,
-                    address, road_address, phone, latitude, longitude, image_url, rating_level
+                    address, road_address, phone, latitude, longitude, rating_level
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     restaurant_id,
@@ -343,7 +345,6 @@ class SqliteRestaurantStore:
                     payload.phone,
                     payload.latitude,
                     payload.longitude,
-                    payload.image_url,
                     payload.rating_level,
                 ),
             )
@@ -488,7 +489,6 @@ class SqliteRestaurantStore:
                     phone = ?,
                     latitude = ?,
                     longitude = ?,
-                    image_url = ?,
                     rating_level = ?
                 WHERE id = ?
                 """,
@@ -508,7 +508,6 @@ class SqliteRestaurantStore:
                     payload.phone,
                     payload.latitude,
                     payload.longitude,
-                    payload.image_url,
                     payload.rating_level,
                     restaurant_id,
                 ),
@@ -755,7 +754,6 @@ class SqliteRestaurantStore:
             phone=row["phone"],
             latitude=row["latitude"],
             longitude=row["longitude"],
-            image_url=row["image_url"],
             rating_level=_normalize_rating_level(row["rating_level"]),
             note_count=int(row["note_count"]),
             created_at=row["created_at"],
@@ -827,7 +825,6 @@ class PgRestaurantStore(SqliteRestaurantStore):
                         phone TEXT,
                         latitude DOUBLE PRECISION,
                         longitude DOUBLE PRECISION,
-                        image_url TEXT,
                         rating_level TEXT NOT NULL DEFAULT '맛남',
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     )
@@ -838,9 +835,9 @@ class PgRestaurantStore(SqliteRestaurantStore):
                 cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS city TEXT")
                 cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS district TEXT")
                 cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS town TEXT")
-                cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS image_url TEXT")
                 cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS rating_level TEXT NOT NULL DEFAULT '맛남'")
                 cursor.execute("ALTER TABLE restaurants ALTER COLUMN rating_level SET DEFAULT '맛남'")
+                cursor.execute("ALTER TABLE restaurants DROP COLUMN IF EXISTS image_url")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_restaurants_user_id ON restaurants(user_id)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_restaurants_area ON restaurants(area)")
                 cursor.execute(
@@ -928,9 +925,9 @@ class PgRestaurantStore(SqliteRestaurantStore):
                     INSERT INTO restaurants (
                         id, user_id, name, area, city, district, town, cuisine, price_level, mood_tags_json,
                         signature_menus_json, kakao_place_id, kakao_place_url,
-                        address, road_address, phone, latitude, longitude, image_url, rating_level
+                        address, road_address, phone, latitude, longitude, rating_level
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         restaurant_id,
@@ -951,7 +948,6 @@ class PgRestaurantStore(SqliteRestaurantStore):
                         payload.phone,
                         payload.latitude,
                         payload.longitude,
-                        payload.image_url,
                         payload.rating_level,
                     ),
                 )
@@ -1214,7 +1210,6 @@ class PgRestaurantStore(SqliteRestaurantStore):
                         phone = %s,
                         latitude = %s,
                         longitude = %s,
-                        image_url = %s,
                         rating_level = %s
                     WHERE id = %s
                     """,
@@ -1234,7 +1229,6 @@ class PgRestaurantStore(SqliteRestaurantStore):
                         payload.phone,
                         payload.latitude,
                         payload.longitude,
-                        payload.image_url,
                         payload.rating_level,
                         restaurant_id,
                     ),
