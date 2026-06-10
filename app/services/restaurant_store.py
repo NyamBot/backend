@@ -53,8 +53,31 @@ def _distance_km(
     return earth_radius_km * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
+def _normalize_rating_level(rating_level: str | None) -> str:
+    return {
+        "상": "인생맛집",
+        "중": "맛남",
+        "하": "쏘쏘",
+        "진짜 맛집": "인생맛집",
+        "맛있음": "맛남",
+        "보통": "쏘쏘",
+    }.get(
+        rating_level or "맛남",
+        rating_level or "맛남",
+    )
+
+
+def _rating_query_values(rating_level: str) -> list[str]:
+    legacy_values = {
+        "인생맛집": ["상", "진짜 맛집"],
+        "맛남": ["중", "맛있음"],
+        "쏘쏘": ["하", "보통"],
+    }.get(rating_level, [])
+    return [rating_level, *legacy_values]
+
+
 def _rating_score(rating_level: str | None) -> float:
-    return {"상": 0.12, "중": 0.0, "하": -0.12}.get(rating_level or "중", 0.0)
+    return {"인생맛집": 0.16, "맛남": 0.06, "쏘쏘": -0.04}.get(_normalize_rating_level(rating_level), 0.0)
 
 
 def _embedding_to_pgvector(vector: list[float]) -> str:
@@ -107,7 +130,7 @@ class SqliteRestaurantStore:
                     latitude REAL,
                     longitude REAL,
                     image_url TEXT,
-                    rating_level TEXT NOT NULL DEFAULT '중',
+                    rating_level TEXT NOT NULL DEFAULT '맛남',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
@@ -176,7 +199,7 @@ class SqliteRestaurantStore:
                 "ALTER TABLE restaurants ADD COLUMN district TEXT",
                 "ALTER TABLE restaurants ADD COLUMN town TEXT",
                 "ALTER TABLE restaurants ADD COLUMN image_url TEXT",
-                "ALTER TABLE restaurants ADD COLUMN rating_level TEXT NOT NULL DEFAULT '중'",
+                "ALTER TABLE restaurants ADD COLUMN rating_level TEXT NOT NULL DEFAULT '맛남'",
                 "ALTER TABLE taste_agent_messages ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
                 "ALTER TABLE taste_agent_messages ADD COLUMN session_id TEXT REFERENCES taste_agent_sessions(id) ON DELETE CASCADE",
             ):
@@ -394,8 +417,10 @@ class SqliteRestaurantStore:
                 )
                 params.extend([f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%"])
         if rating_level:
-            clauses.append("restaurants.rating_level = ?")
-            params.append(rating_level)
+            rating_values = _rating_query_values(rating_level)
+            placeholders = ", ".join("?" for _ in rating_values)
+            clauses.append(f"restaurants.rating_level IN ({placeholders})")
+            params.extend(rating_values)
         if query:
             like = f"%{query}%"
             clauses.append(
@@ -731,7 +756,7 @@ class SqliteRestaurantStore:
             latitude=row["latitude"],
             longitude=row["longitude"],
             image_url=row["image_url"],
-            rating_level=row["rating_level"],
+            rating_level=_normalize_rating_level(row["rating_level"]),
             note_count=int(row["note_count"]),
             created_at=row["created_at"],
         )
@@ -803,7 +828,7 @@ class PgRestaurantStore(SqliteRestaurantStore):
                         latitude DOUBLE PRECISION,
                         longitude DOUBLE PRECISION,
                         image_url TEXT,
-                        rating_level TEXT NOT NULL DEFAULT '중',
+                        rating_level TEXT NOT NULL DEFAULT '맛남',
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     )
                     """
@@ -814,7 +839,8 @@ class PgRestaurantStore(SqliteRestaurantStore):
                 cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS district TEXT")
                 cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS town TEXT")
                 cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS image_url TEXT")
-                cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS rating_level TEXT NOT NULL DEFAULT '중'")
+                cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS rating_level TEXT NOT NULL DEFAULT '맛남'")
+                cursor.execute("ALTER TABLE restaurants ALTER COLUMN rating_level SET DEFAULT '맛남'")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_restaurants_user_id ON restaurants(user_id)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_restaurants_area ON restaurants(area)")
                 cursor.execute(
@@ -1110,8 +1136,10 @@ class PgRestaurantStore(SqliteRestaurantStore):
                 )
                 params.extend([f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%"])
         if rating_level:
-            clauses.append("restaurants.rating_level = %s")
-            params.append(rating_level)
+            rating_values = _rating_query_values(rating_level)
+            placeholders = ", ".join("%s" for _ in rating_values)
+            clauses.append(f"restaurants.rating_level IN ({placeholders})")
+            params.extend(rating_values)
         if query:
             like = f"%{query}%"
             clauses.append(

@@ -64,7 +64,7 @@ class RestaurantCreate(BaseModel):
     latitude: float | None = None
     longitude: float | None = None
     image_url: str | None = None
-    rating_level: str = "중"
+    rating_level: str = "맛남"
 
 
 class RestaurantUpdate(BaseModel):
@@ -84,7 +84,7 @@ class RestaurantUpdate(BaseModel):
     latitude: float | None = None
     longitude: float | None = None
     image_url: str | None = None
-    rating_level: str = "중"
+    rating_level: str = "맛남"
 
 
 class RestaurantNoteCreate(BaseModel):

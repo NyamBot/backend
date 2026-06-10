@@ -553,7 +553,7 @@ def _recommendations_from_kakao_places(
             latitude=latitude_value,
             longitude=longitude_value,
             image_url=None,
-            rating_level="중",
+            rating_level="맛남",
             note_count=0,
             created_at=created_at,
         )
@@ -854,7 +854,7 @@ def _build_fallback_recommendations(query: str, limit: int) -> list[RestaurantRe
             latitude=None,
             longitude=None,
             image_url=None,
-            rating_level="중",
+            rating_level="맛남",
             note_count=0,
             created_at=created_at,
         )
