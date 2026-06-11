@@ -53,6 +53,33 @@ def _distance_km(
     return earth_radius_km * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
+def _normalize_rating_level(rating_level: str | None) -> str:
+    return {
+        "상": "인생맛집",
+        "중": "맛남",
+        "하": "쏘쏘",
+        "진짜 맛집": "인생맛집",
+        "맛있음": "맛남",
+        "보통": "쏘쏘",
+    }.get(
+        rating_level or "맛남",
+        rating_level or "맛남",
+    )
+
+
+def _rating_query_values(rating_level: str) -> list[str]:
+    legacy_values = {
+        "인생맛집": ["상", "진짜 맛집"],
+        "맛남": ["중", "맛있음"],
+        "쏘쏘": ["하", "보통"],
+    }.get(rating_level, [])
+    return [rating_level, *legacy_values]
+
+
+def _rating_score(rating_level: str | None) -> float:
+    return {"인생맛집": 0.16, "맛남": 0.06, "쏘쏘": -0.04}.get(_normalize_rating_level(rating_level), 0.0)
+
+
 def _embedding_to_pgvector(vector: list[float]) -> str:
     return "[" + ",".join(str(value) for value in vector) + "]"
 
@@ -88,6 +115,9 @@ class SqliteRestaurantStore:
                     user_id TEXT,
                     name TEXT NOT NULL,
                     area TEXT NOT NULL,
+                    city TEXT,
+                    district TEXT,
+                    town TEXT,
                     cuisine TEXT NOT NULL,
                     price_level TEXT NOT NULL,
                     mood_tags_json TEXT NOT NULL,
@@ -99,6 +129,7 @@ class SqliteRestaurantStore:
                     phone TEXT,
                     latitude REAL,
                     longitude REAL,
+                    rating_level TEXT NOT NULL DEFAULT '맛남',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
@@ -163,6 +194,10 @@ class SqliteRestaurantStore:
             for statement in (
                 "ALTER TABLE restaurants ADD COLUMN latitude REAL",
                 "ALTER TABLE restaurants ADD COLUMN longitude REAL",
+                "ALTER TABLE restaurants ADD COLUMN city TEXT",
+                "ALTER TABLE restaurants ADD COLUMN district TEXT",
+                "ALTER TABLE restaurants ADD COLUMN town TEXT",
+                "ALTER TABLE restaurants ADD COLUMN rating_level TEXT NOT NULL DEFAULT '맛남'",
                 "ALTER TABLE taste_agent_messages ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
                 "ALTER TABLE taste_agent_messages ADD COLUMN session_id TEXT REFERENCES taste_agent_sessions(id) ON DELETE CASCADE",
             ):
@@ -170,6 +205,10 @@ class SqliteRestaurantStore:
                     connection.execute(statement)
                 except sqlite3.OperationalError:
                     pass
+            try:
+                connection.execute("ALTER TABLE restaurants DROP COLUMN image_url")
+            except sqlite3.OperationalError:
+                pass
 
     def create_user(
         self,
@@ -258,25 +297,43 @@ class SqliteRestaurantStore:
             ).fetchone()
         return dict(row) if row else None
 
+    def delete_user(self, user_id: str) -> bool:
+        with self._connect() as connection:
+            restaurant_rows = connection.execute(
+                "SELECT id FROM restaurants WHERE user_id = ?",
+                (user_id,),
+            ).fetchall()
+            restaurant_ids = [row["id"] for row in restaurant_rows]
+            for restaurant_id in restaurant_ids:
+                connection.execute("DELETE FROM restaurant_notes WHERE restaurant_id = ?", (restaurant_id,))
+            connection.execute("DELETE FROM restaurants WHERE user_id = ?", (user_id,))
+            connection.execute("DELETE FROM taste_agent_messages WHERE user_id = ?", (user_id,))
+            connection.execute("DELETE FROM taste_agent_sessions WHERE user_id = ?", (user_id,))
+            cursor = connection.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            return cursor.rowcount > 0
+
     def create_restaurant(self, payload: RestaurantCreate) -> RestaurantResponse:
         restaurant_id = str(uuid4())
         note_id = str(uuid4())
-        note_tags = sorted(set(payload.mood_tags + [payload.area, payload.cuisine, payload.price_level]))
+        note_tags = sorted(set(payload.mood_tags + [payload.area, payload.cuisine, payload.price_level, payload.rating_level]))
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO restaurants (
-                    id, user_id, name, area, cuisine, price_level, mood_tags_json,
+                    id, user_id, name, area, city, district, town, cuisine, price_level, mood_tags_json,
                     signature_menus_json, kakao_place_id, kakao_place_url,
-                    address, road_address, phone, latitude, longitude
+                    address, road_address, phone, latitude, longitude, rating_level
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     restaurant_id,
                     payload.user_id,
                     payload.name,
                     payload.area,
+                    payload.city,
+                    payload.district,
+                    payload.town,
                     payload.cuisine,
                     payload.price_level,
                     json.dumps(payload.mood_tags, ensure_ascii=False),
@@ -288,6 +345,7 @@ class SqliteRestaurantStore:
                     payload.phone,
                     payload.latitude,
                     payload.longitude,
+                    payload.rating_level,
                 ),
             )
             connection.execute(
@@ -332,9 +390,57 @@ class SqliteRestaurantStore:
             )
         return self.get_restaurant(restaurant_id)
 
-    def list_restaurants(self, user_id: str | None = None) -> list[RestaurantResponse]:
-        where_clause = "WHERE restaurants.user_id = ?" if user_id else ""
-        params = (user_id,) if user_id else ()
+    def list_restaurants(
+        self,
+        user_id: str | None = None,
+        city: str | None = None,
+        district: str | None = None,
+        town: str | None = None,
+        query: str | None = None,
+        rating_level: str | None = None,
+    ) -> list[RestaurantResponse]:
+        clauses = []
+        params: list[str] = []
+        if user_id:
+            clauses.append("restaurants.user_id = ?")
+            params.append(user_id)
+        for value in (city, district, town):
+            if value:
+                clauses.append(
+                    """(
+                        restaurants.city LIKE ?
+                        OR restaurants.district LIKE ?
+                        OR restaurants.town LIKE ?
+                        OR restaurants.road_address LIKE ?
+                        OR restaurants.address LIKE ?
+                        OR restaurants.area LIKE ?
+                    )"""
+                )
+                params.extend([f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%"])
+        if rating_level:
+            rating_values = _rating_query_values(rating_level)
+            placeholders = ", ".join("?" for _ in rating_values)
+            clauses.append(f"restaurants.rating_level IN ({placeholders})")
+            params.extend(rating_values)
+        if query:
+            like = f"%{query}%"
+            clauses.append(
+                """(
+                    restaurants.name LIKE ?
+                    OR restaurants.area LIKE ?
+                    OR restaurants.city LIKE ?
+                    OR restaurants.district LIKE ?
+                    OR restaurants.cuisine LIKE ?
+                    OR restaurants.price_level LIKE ?
+                    OR restaurants.mood_tags_json LIKE ?
+                    OR restaurants.signature_menus_json LIKE ?
+                    OR restaurants.address LIKE ?
+                    OR restaurants.road_address LIKE ?
+                    OR restaurants.phone LIKE ?
+                )"""
+            )
+            params.extend([like] * 11)
+        where_clause = "WHERE " + " AND ".join(clauses) if clauses else ""
         with self._connect() as connection:
             rows = connection.execute(
                 f"""
@@ -345,7 +451,7 @@ class SqliteRestaurantStore:
                 GROUP BY restaurants.id
                 ORDER BY restaurants.created_at DESC
                 """,
-                params,
+                tuple(params),
             ).fetchall()
         return [self._restaurant_from_row(row) for row in rows]
 
@@ -370,6 +476,9 @@ class SqliteRestaurantStore:
                 UPDATE restaurants
                 SET name = ?,
                     area = ?,
+                    city = ?,
+                    district = ?,
+                    town = ?,
                     cuisine = ?,
                     price_level = ?,
                     mood_tags_json = ?,
@@ -379,12 +488,16 @@ class SqliteRestaurantStore:
                     road_address = ?,
                     phone = ?,
                     latitude = ?,
-                    longitude = ?
+                    longitude = ?,
+                    rating_level = ?
                 WHERE id = ?
                 """,
                 (
                     payload.name,
                     payload.area,
+                    payload.city,
+                    payload.district,
+                    payload.town,
                     payload.cuisine,
                     payload.price_level,
                     json.dumps(payload.mood_tags, ensure_ascii=False),
@@ -395,6 +508,7 @@ class SqliteRestaurantStore:
                     payload.phone,
                     payload.latitude,
                     payload.longitude,
+                    payload.rating_level,
                     restaurant_id,
                 ),
             )
@@ -432,7 +546,7 @@ class SqliteRestaurantStore:
             keyword_score = 0.05 if any(term and term in row["content"].lower() for term in normalized_terms) else 0.0
             distance = _distance_km(latitude, longitude, row["latitude"], row["longitude"])
             distance_score = 0.0 if distance is None else max(0.0, 0.18 - min(distance, 10.0) * 0.018)
-            score = vector_score + tag_score + keyword_score + distance_score
+            score = vector_score + tag_score + keyword_score + distance_score + _rating_score(row["rating_level"])
             bucket = scored.setdefault(
                 row["id"],
                 {
@@ -626,6 +740,9 @@ class SqliteRestaurantStore:
             user_id=row["user_id"],
             name=row["name"],
             area=row["area"],
+            city=row["city"],
+            district=row["district"],
+            town=row["town"],
             cuisine=row["cuisine"],
             price_level=row["price_level"],
             mood_tags=_json_list(row["mood_tags_json"]),
@@ -637,6 +754,7 @@ class SqliteRestaurantStore:
             phone=row["phone"],
             latitude=row["latitude"],
             longitude=row["longitude"],
+            rating_level=_normalize_rating_level(row["rating_level"]),
             note_count=int(row["note_count"]),
             created_at=row["created_at"],
         )
@@ -693,6 +811,9 @@ class PgRestaurantStore(SqliteRestaurantStore):
                         user_id TEXT,
                         name TEXT NOT NULL,
                         area TEXT NOT NULL,
+                        city TEXT,
+                        district TEXT,
+                        town TEXT,
                         cuisine TEXT NOT NULL,
                         price_level TEXT NOT NULL,
                         mood_tags_json TEXT NOT NULL,
@@ -704,12 +825,19 @@ class PgRestaurantStore(SqliteRestaurantStore):
                         phone TEXT,
                         latitude DOUBLE PRECISION,
                         longitude DOUBLE PRECISION,
+                        rating_level TEXT NOT NULL DEFAULT '맛남',
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     )
                     """
                 )
                 cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION")
                 cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION")
+                cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS city TEXT")
+                cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS district TEXT")
+                cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS town TEXT")
+                cursor.execute("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS rating_level TEXT NOT NULL DEFAULT '맛남'")
+                cursor.execute("ALTER TABLE restaurants ALTER COLUMN rating_level SET DEFAULT '맛남'")
+                cursor.execute("ALTER TABLE restaurants DROP COLUMN IF EXISTS image_url")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_restaurants_user_id ON restaurants(user_id)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_restaurants_area ON restaurants(area)")
                 cursor.execute(
@@ -789,23 +917,26 @@ class PgRestaurantStore(SqliteRestaurantStore):
     def create_restaurant(self, payload: RestaurantCreate) -> RestaurantResponse:
         restaurant_id = str(uuid4())
         note_id = str(uuid4())
-        note_tags = sorted(set(payload.mood_tags + [payload.area, payload.cuisine, payload.price_level]))
+        note_tags = sorted(set(payload.mood_tags + [payload.area, payload.cuisine, payload.price_level, payload.rating_level]))
         with self._connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
                     INSERT INTO restaurants (
-                        id, user_id, name, area, cuisine, price_level, mood_tags_json,
+                        id, user_id, name, area, city, district, town, cuisine, price_level, mood_tags_json,
                         signature_menus_json, kakao_place_id, kakao_place_url,
-                        address, road_address, phone, latitude, longitude
+                        address, road_address, phone, latitude, longitude, rating_level
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         restaurant_id,
                         payload.user_id,
                         payload.name,
                         payload.area,
+                        payload.city,
+                        payload.district,
+                        payload.town,
                         payload.cuisine,
                         payload.price_level,
                         json.dumps(payload.mood_tags, ensure_ascii=False),
@@ -817,6 +948,7 @@ class PgRestaurantStore(SqliteRestaurantStore):
                         payload.phone,
                         payload.latitude,
                         payload.longitude,
+                        payload.rating_level,
                     ),
                 )
                 cursor.execute(
@@ -957,9 +1089,72 @@ class PgRestaurantStore(SqliteRestaurantStore):
                 )
                 return cursor.fetchone()
 
-    def list_restaurants(self, user_id: str | None = None) -> list[RestaurantResponse]:
-        where_clause = "WHERE restaurants.user_id = %s" if user_id else ""
-        params = (user_id,) if user_id else ()
+    def delete_user(self, user_id: str) -> bool:
+        with self._connect() as connection:
+            with connection.cursor(row_factory=self.dict_row) as cursor:
+                cursor.execute("SELECT id FROM restaurants WHERE user_id = %s", (user_id,))
+                restaurant_ids = [row["id"] for row in cursor.fetchall()]
+                for restaurant_id in restaurant_ids:
+                    cursor.execute("DELETE FROM restaurant_notes WHERE restaurant_id = %s", (restaurant_id,))
+                cursor.execute("DELETE FROM restaurants WHERE user_id = %s", (user_id,))
+                cursor.execute("DELETE FROM taste_agent_messages WHERE user_id = %s", (user_id,))
+                cursor.execute("DELETE FROM taste_agent_sessions WHERE user_id = %s", (user_id,))
+                cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
+                deleted = cursor.rowcount > 0
+            connection.commit()
+        return deleted
+
+    def list_restaurants(
+        self,
+        user_id: str | None = None,
+        city: str | None = None,
+        district: str | None = None,
+        town: str | None = None,
+        query: str | None = None,
+        rating_level: str | None = None,
+    ) -> list[RestaurantResponse]:
+        clauses = []
+        params: list[str] = []
+        if user_id:
+            clauses.append("restaurants.user_id = %s")
+            params.append(user_id)
+        for value in (city, district, town):
+            if value:
+                clauses.append(
+                    """(
+                        restaurants.city ILIKE %s
+                        OR restaurants.district ILIKE %s
+                        OR restaurants.town ILIKE %s
+                        OR restaurants.road_address ILIKE %s
+                        OR restaurants.address ILIKE %s
+                        OR restaurants.area ILIKE %s
+                    )"""
+                )
+                params.extend([f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%"])
+        if rating_level:
+            rating_values = _rating_query_values(rating_level)
+            placeholders = ", ".join("%s" for _ in rating_values)
+            clauses.append(f"restaurants.rating_level IN ({placeholders})")
+            params.extend(rating_values)
+        if query:
+            like = f"%{query}%"
+            clauses.append(
+                """(
+                    restaurants.name ILIKE %s
+                    OR restaurants.area ILIKE %s
+                    OR restaurants.city ILIKE %s
+                    OR restaurants.district ILIKE %s
+                    OR restaurants.cuisine ILIKE %s
+                    OR restaurants.price_level ILIKE %s
+                    OR restaurants.mood_tags_json ILIKE %s
+                    OR restaurants.signature_menus_json ILIKE %s
+                    OR restaurants.address ILIKE %s
+                    OR restaurants.road_address ILIKE %s
+                    OR restaurants.phone ILIKE %s
+                )"""
+            )
+            params.extend([like] * 11)
+        where_clause = "WHERE " + " AND ".join(clauses) if clauses else ""
         with self._connect() as connection:
             with connection.cursor(row_factory=self.dict_row) as cursor:
                 cursor.execute(
@@ -972,7 +1167,7 @@ class PgRestaurantStore(SqliteRestaurantStore):
                     GROUP BY restaurants.id
                     ORDER BY restaurants.created_at DESC
                     """,
-                    params,
+                    tuple(params),
                 )
                 rows = cursor.fetchall()
         return [self._restaurant_from_row(row) for row in rows]
@@ -1002,6 +1197,9 @@ class PgRestaurantStore(SqliteRestaurantStore):
                     UPDATE restaurants
                     SET name = %s,
                         area = %s,
+                        city = %s,
+                        district = %s,
+                        town = %s,
                         cuisine = %s,
                         price_level = %s,
                         mood_tags_json = %s,
@@ -1011,12 +1209,16 @@ class PgRestaurantStore(SqliteRestaurantStore):
                         road_address = %s,
                         phone = %s,
                         latitude = %s,
-                        longitude = %s
+                        longitude = %s,
+                        rating_level = %s
                     WHERE id = %s
                     """,
                     (
                         payload.name,
                         payload.area,
+                        payload.city,
+                        payload.district,
+                        payload.town,
                         payload.cuisine,
                         payload.price_level,
                         json.dumps(payload.mood_tags, ensure_ascii=False),
@@ -1027,6 +1229,7 @@ class PgRestaurantStore(SqliteRestaurantStore):
                         payload.phone,
                         payload.latitude,
                         payload.longitude,
+                        payload.rating_level,
                         restaurant_id,
                     ),
                 )
@@ -1042,6 +1245,94 @@ class PgRestaurantStore(SqliteRestaurantStore):
                 deleted = cursor.rowcount > 0
             connection.commit()
         return deleted
+
+    def recommend(
+        self,
+        query: str,
+        user_id: str | None,
+        area: str | None,
+        cuisine: str | None,
+        price_level: str | None,
+        tags: list[str],
+        latitude: float | None,
+        longitude: float | None,
+        limit: int,
+    ) -> list[RestaurantRecommendation]:
+        query_text = " ".join([query, area or "", cuisine or "", price_level or "", " ".join(tags)])
+        query_embedding = _embedding_to_pgvector(_embed(query_text))
+        rows = self._search_vector_note_rows(query_embedding, user_id, area, cuisine, price_level, limit * 8)
+        scored: dict[str, dict[str, Any]] = {}
+        normalized_terms = {term.lower() for term in tags + [query, area or "", cuisine or "", price_level or ""] if term}
+        for row in rows:
+            note_tags = {tag.lower() for tag in _json_list(row["tags_json"])}
+            restaurant_tags = {tag.lower() for tag in _json_list(row["mood_tags_json"])}
+            vector_score = float(row["vector_score"])
+            tag_score = 0.08 * len(normalized_terms & (note_tags | restaurant_tags))
+            keyword_score = 0.05 if any(term and term in row["content"].lower() for term in normalized_terms) else 0.0
+            distance = _distance_km(latitude, longitude, row["latitude"], row["longitude"])
+            distance_score = 0.0 if distance is None else max(0.0, 0.18 - min(distance, 10.0) * 0.018)
+            score = vector_score + tag_score + keyword_score + distance_score + _rating_score(row["rating_level"])
+            bucket = scored.setdefault(
+                row["id"],
+                {
+                    "restaurant": self._restaurant_from_row(row),
+                    "score": 0.0,
+                    "evidence": [],
+                    "distance_km": distance,
+                },
+            )
+            bucket["score"] = max(bucket["score"], score)
+            if distance is not None:
+                bucket["distance_km"] = distance
+            if len(bucket["evidence"]) < 2:
+                bucket["evidence"].append(row["content"])
+        ranked = sorted(scored.values(), key=lambda item: item["score"], reverse=True)
+        return [self._recommendation_from_bucket(item) for item in ranked[:limit]]
+
+    def _search_vector_note_rows(
+        self,
+        query_embedding: str,
+        user_id: str | None,
+        area: str | None,
+        cuisine: str | None,
+        price_level: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = [query_embedding]
+        if user_id:
+            clauses.append("restaurants.user_id = %s")
+            params.append(user_id)
+        if area:
+            clauses.append("restaurants.area ILIKE %s")
+            params.append(f"%{area}%")
+        if cuisine:
+            clauses.append("restaurants.cuisine ILIKE %s")
+            params.append(f"%{cuisine}%")
+        if price_level:
+            clauses.append("restaurants.price_level = %s")
+            params.append(price_level)
+        where_clause = "WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(max(limit, 1))
+        with self._connect() as connection:
+            with connection.cursor(row_factory=self.dict_row) as cursor:
+                cursor.execute(
+                    f"""
+                    WITH query_embedding AS (SELECT %s::vector AS embedding)
+                    SELECT restaurants.*, restaurants.created_at::text AS created_at,
+                        COUNT(restaurant_notes.id) OVER (PARTITION BY restaurants.id)::int AS note_count,
+                        restaurant_notes.content, restaurant_notes.tags_json,
+                        1 - (restaurant_notes.embedding <=> query_embedding.embedding) AS vector_score
+                    FROM restaurant_notes
+                    JOIN restaurants ON restaurants.id = restaurant_notes.restaurant_id
+                    CROSS JOIN query_embedding
+                    {where_clause}
+                    ORDER BY restaurant_notes.embedding <=> query_embedding.embedding
+                    LIMIT %s
+                    """,
+                    tuple(params),
+                )
+                return list(cursor.fetchall())
 
     def _search_note_rows(
         self,
@@ -1235,15 +1526,20 @@ class PgRestaurantStore(SqliteRestaurantStore):
 
 class RestaurantStore:
     def __init__(self) -> None:
+        self.initialization_error: str | None = None
         try:
             if settings.database_url.startswith(("postgresql://", "postgres://")):
                 self.backend = PgRestaurantStore(settings.database_url)
+                self.backend_name = "pgvector"
             elif settings.database_url.startswith("sqlite:///"):
                 self.backend = SqliteRestaurantStore(settings.database_url)
+                self.backend_name = "sqlite-vector"
             else:
                 raise ValueError("Unsupported DATABASE_URL")
-        except Exception:
+        except Exception as error:
+            self.initialization_error = str(error)
             self.backend = SqliteRestaurantStore("sqlite:///./data/nyambot.db")
+            self.backend_name = "sqlite-vector"
 
     def create_restaurant(self, payload: RestaurantCreate) -> RestaurantResponse:
         return self.backend.create_restaurant(payload)
@@ -1280,8 +1576,19 @@ class RestaurantStore:
     def get_user_by_provider(self, auth_provider: str, provider_subject: str) -> dict[str, Any] | None:
         return self.backend.get_user_by_provider(auth_provider, provider_subject)
 
-    def list_restaurants(self, user_id: str | None = None) -> list[RestaurantResponse]:
-        return self.backend.list_restaurants(user_id)
+    def delete_user(self, user_id: str) -> bool:
+        return self.backend.delete_user(user_id)
+
+    def list_restaurants(
+        self,
+        user_id: str | None = None,
+        city: str | None = None,
+        district: str | None = None,
+        town: str | None = None,
+        query: str | None = None,
+        rating_level: str | None = None,
+    ) -> list[RestaurantResponse]:
+        return self.backend.list_restaurants(user_id, city, district, town, query, rating_level)
 
     def get_restaurant(self, restaurant_id: str) -> RestaurantResponse | None:
         return self.backend.get_restaurant(restaurant_id)

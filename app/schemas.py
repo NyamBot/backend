@@ -48,6 +48,9 @@ class RestaurantCreate(BaseModel):
     user_id: str | None = None
     name: str = Field(min_length=1, max_length=120)
     area: str = Field(min_length=1, max_length=80)
+    city: str | None = None
+    district: str | None = None
+    town: str | None = None
     cuisine: str = Field(min_length=1, max_length=80)
     price_level: str = "1~2만원"
     mood_tags: list[str] = []
@@ -60,11 +63,15 @@ class RestaurantCreate(BaseModel):
     phone: str | None = None
     latitude: float | None = None
     longitude: float | None = None
+    rating_level: str = "맛남"
 
 
 class RestaurantUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     area: str = Field(min_length=1, max_length=80)
+    city: str | None = None
+    district: str | None = None
+    town: str | None = None
     cuisine: str = Field(min_length=1, max_length=80)
     price_level: str
     mood_tags: list[str] = []
@@ -75,6 +82,7 @@ class RestaurantUpdate(BaseModel):
     phone: str | None = None
     latitude: float | None = None
     longitude: float | None = None
+    rating_level: str = "맛남"
 
 
 class RestaurantNoteCreate(BaseModel):
@@ -113,6 +121,9 @@ class RestaurantResponse(BaseModel):
     user_id: str | None
     name: str
     area: str
+    city: str | None
+    district: str | None
+    town: str | None
     cuisine: str
     price_level: str
     mood_tags: list[str]
@@ -124,6 +135,7 @@ class RestaurantResponse(BaseModel):
     phone: str | None
     latitude: float | None
     longitude: float | None
+    rating_level: str
     note_count: int
     created_at: str
 
