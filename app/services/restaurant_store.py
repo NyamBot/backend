@@ -18,6 +18,7 @@ from app.schemas import (
     TasteAgentMessage,
     TasteAgentSession,
 )
+from app.services.chat_message_store import chat_message_store
 
 VECTOR_DIMENSIONS = 96
 USER_LEVELS = (
@@ -1615,6 +1616,7 @@ class PgRestaurantStore(SqliteRestaurantStore):
 class RestaurantStore:
     def __init__(self) -> None:
         self.initialization_error: str | None = None
+        self.chat_message_error: str | None = None
         try:
             if settings.database_url.startswith(("postgresql://", "postgres://")):
                 self.backend = PgRestaurantStore(settings.database_url)
@@ -1671,7 +1673,13 @@ class RestaurantStore:
         return self.backend.add_user_level_event(user_id, event_type)
 
     def delete_user(self, user_id: str) -> bool:
-        return self.backend.delete_user(user_id)
+        deleted = self.backend.delete_user(user_id)
+        if deleted and chat_message_store.enabled:
+            try:
+                chat_message_store.delete_user_messages(user_id)
+            except Exception as error:
+                self.chat_message_error = str(error)
+        return deleted
 
     def list_restaurants(
         self,
@@ -1717,9 +1725,19 @@ class RestaurantStore:
         retrieved_context: list[str],
         metadata: dict[str, Any] | None = None,
     ) -> TasteAgentMessage:
+        if chat_message_store.enabled:
+            try:
+                return chat_message_store.save_message(session_id, user_id, role, content, retrieved_context, metadata)
+            except Exception as error:
+                self.chat_message_error = str(error)
         return self.backend.save_message(session_id, user_id, role, content, retrieved_context, metadata)
 
     def list_messages(self, user_id: str | None) -> list[TasteAgentMessage]:
+        if chat_message_store.enabled:
+            try:
+                return chat_message_store.list_messages(user_id)
+            except Exception as error:
+                self.chat_message_error = str(error)
         return self.backend.list_messages(user_id)
 
     def ensure_chat_session(self, user_id: str | None, session_id: str | None, title: str) -> str:
@@ -1729,7 +1747,40 @@ class RestaurantStore:
         self.backend.touch_chat_session(session_id)
 
     def list_sessions(self, user_id: str | None) -> list[TasteAgentSession]:
-        return self.backend.list_sessions(user_id)
+        sessions = self.backend.list_sessions(user_id)
+        if not chat_message_store.enabled:
+            return sessions
+        try:
+            messages = chat_message_store.list_messages(user_id)
+        except Exception as error:
+            self.chat_message_error = str(error)
+            return sessions
+
+        grouped: dict[str, list[TasteAgentMessage]] = {}
+        legacy_messages: list[TasteAgentMessage] = []
+        for message in messages:
+            if message.session_id:
+                grouped.setdefault(message.session_id, []).append(message)
+            else:
+                legacy_messages.append(message)
+
+        refreshed_sessions = [
+            session.model_copy(update={"messages": grouped.get(session.id, [])})
+            for session in sessions
+            if session.id != "legacy"
+        ]
+        if legacy_messages:
+            refreshed_sessions.append(
+                TasteAgentSession(
+                    id="legacy",
+                    user_id=user_id,
+                    title="이전 대화 기록",
+                    created_at=legacy_messages[0].created_at,
+                    updated_at=legacy_messages[-1].created_at,
+                    messages=legacy_messages,
+                )
+            )
+        return refreshed_sessions
 
 
 restaurant_store = RestaurantStore()

@@ -27,5 +27,7 @@ def health() -> HealthResponse:
         status="ok",
         app=settings.app_name,
         vector_store=restaurant_store.backend_name,
+        chat_message_store=settings.chat_message_backend,
+        chat_message_error=restaurant_store.chat_message_error,
         database_url=settings.database_url,
     )

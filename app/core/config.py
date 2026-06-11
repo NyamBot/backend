@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     huggingface_chat_base_url: str = "https://router.huggingface.co/v1"
     huggingface_chat_model: str = "google/gemma-4-26B-A4B-it:featherless-ai"
     huggingface_chat_timeout_seconds: float = 20.0
+    chat_message_backend: str = "opensearch"
+    opensearch_url: str = "http://127.0.0.1:9200"
+    opensearch_username: str | None = None
+    opensearch_password: str | None = None
+    opensearch_chat_messages_index: str = "nyambot-chat-messages"
+    opensearch_verify_certs: bool = False
 
     model_config = SettingsConfigDict(
         env_file=(".env", f".env.{APP_ENV}"),
