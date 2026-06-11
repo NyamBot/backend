@@ -2,11 +2,14 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.core.dependencies import get_current_user
 from app.schemas import (
+    RestaurantChatCancelRequest,
+    RestaurantChatCancelResponse,
     RestaurantChatRequest,
     RestaurantChatResponse,
     RestaurantCreate,
@@ -22,6 +25,7 @@ from app.schemas import (
     TasteAgentSessionsResponse,
     UserResponse,
 )
+from app.services.chat_cancel_store import chat_cancel_store
 from app.services.huggingface_chat import HuggingFaceChatError, huggingface_chat_service
 from app.services.kakao_local import KakaoLocalApiError, get_kakao_local_api_key, search_places
 from app.services.restaurant_store import restaurant_store
@@ -284,6 +288,25 @@ def chat(
     area_filter = location_criteria.store_area if location_criteria else None
     effective_limit = max(payload.limit, MIN_CHAT_RECOMMENDATIONS)
     session_id = restaurant_store.ensure_chat_session(current_user.id, payload.session_id, query)
+    request_id = payload.request_id or str(uuid4())
+    chat_cancel_store.register(current_user.id, session_id, request_id)
+    try:
+        return _run_chat(payload, current_user, query, location_criteria, requested_area, area_filter, effective_limit, session_id, request_id)
+    finally:
+        chat_cancel_store.complete(request_id)
+
+
+def _run_chat(
+    payload: RestaurantChatRequest,
+    current_user: UserResponse,
+    query: str,
+    location_criteria: LocationCriteria | None,
+    requested_area: str | None,
+    area_filter: str | None,
+    effective_limit: int,
+    session_id: str,
+    request_id: str,
+) -> RestaurantChatResponse:
     recommendations = restaurant_store.recommend(
         query=query,
         user_id=current_user.id,
@@ -368,6 +391,7 @@ def chat(
     else:
         answer = _build_answer(query, recommendations, fallback=not has_saved_restaurants or used_nearby_fallback)
     request_metadata = {
+        "request_id": request_id,
         "area": requested_area,
         "area_filter": area_filter,
         "location_criteria": {
@@ -386,6 +410,16 @@ def chat(
         "limit": payload.limit,
     }
     restaurant_store.save_message(session_id, current_user.id, "user", query, [], request_metadata)
+    if chat_cancel_store.is_cancelled(request_id):
+        restaurant_store.touch_chat_session(session_id)
+        return RestaurantChatResponse(
+            session_id=session_id,
+            request_id=request_id,
+            cancelled=True,
+            answer="응답 생성을 중지했어요.",
+            recommendations=[],
+            context=[],
+        )
     restaurant_store.save_message(
         session_id,
         current_user.id,
@@ -393,6 +427,7 @@ def chat(
         answer,
         context,
         {
+            "request_id": request_id,
             "recommendation_count": len(recommendations),
             "restaurant_names": [recommendation.restaurant.name for recommendation in recommendations],
             "recommendations": [recommendation.model_dump(mode="json") for recommendation in recommendations],
@@ -403,7 +438,32 @@ def chat(
         },
     )
     restaurant_store.touch_chat_session(session_id)
-    return RestaurantChatResponse(session_id=session_id, answer=answer, recommendations=recommendations, context=context)
+    return RestaurantChatResponse(
+        session_id=session_id,
+        request_id=request_id,
+        answer=answer,
+        recommendations=recommendations,
+        context=context,
+    )
+
+
+@router.post("/chat/cancel", response_model=RestaurantChatCancelResponse)
+def cancel_chat(
+    payload: RestaurantChatCancelRequest,
+    current_user: UserResponse = Depends(get_current_user),
+) -> RestaurantChatCancelResponse:
+    if not payload.session_id and not payload.request_id:
+        raise HTTPException(status_code=400, detail="session_id or request_id is required")
+    cancelled = chat_cancel_store.cancel(
+        user_id=current_user.id,
+        session_id=payload.session_id,
+        request_id=payload.request_id,
+    )
+    return RestaurantChatCancelResponse(
+        cancelled=cancelled,
+        session_id=payload.session_id,
+        request_id=payload.request_id,
+    )
 
 
 @router.get("/chat/messages", response_model=TasteAgentMessagesResponse)

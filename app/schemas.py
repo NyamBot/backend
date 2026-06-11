@@ -199,10 +199,24 @@ class RestaurantRecommendationsResponse(BaseModel):
 class RestaurantChatRequest(RestaurantRecommendationRequest):
     message: str = Field(min_length=1)
     session_id: str | None = None
+    request_id: str | None = None
+
+
+class RestaurantChatCancelRequest(BaseModel):
+    session_id: str | None = None
+    request_id: str | None = None
+
+
+class RestaurantChatCancelResponse(BaseModel):
+    cancelled: bool
+    session_id: str | None = None
+    request_id: str | None = None
 
 
 class RestaurantChatResponse(BaseModel):
     session_id: str
+    request_id: str
+    cancelled: bool = False
     answer: str
     recommendations: list[RestaurantRecommendation]
     context: list[str]
