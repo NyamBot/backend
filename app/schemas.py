@@ -25,8 +25,39 @@ class UserResponse(BaseModel):
     avatar_url: str | None
     auth_provider: str
     provider_subject: str | None
+    role: str = "user"
+    level_points: int = 0
+    level_key: str = "egg"
+    level_label: str = "알"
     created_at: str
     last_login_at: str | None
+
+
+class UserLevelResponse(BaseModel):
+    user_id: str
+    level_points: int
+    level_key: str
+    level_label: str
+    current_level_min_points: int
+    next_level_key: str | None
+    next_level_label: str | None
+    next_level_min_points: int | None
+    points_to_next_level: int | None
+
+
+class UserLevelEventRequest(BaseModel):
+    event_type: str = Field(
+        description=(
+            "Supported events: restaurant_saved, restaurant_shared, quality_note, "
+            "like_received, saved_by_other, weekly_share"
+        )
+    )
+
+
+class UserLevelEventResponse(BaseModel):
+    event_type: str
+    points_added: int
+    level: UserLevelResponse
 
 
 class AuthCallbackResponse(BaseModel):
@@ -63,7 +94,6 @@ class RestaurantCreate(BaseModel):
     phone: str | None = None
     latitude: float | None = None
     longitude: float | None = None
-    rating_level: str = "맛남"
 
 
 class RestaurantUpdate(BaseModel):
@@ -82,7 +112,6 @@ class RestaurantUpdate(BaseModel):
     phone: str | None = None
     latitude: float | None = None
     longitude: float | None = None
-    rating_level: str = "맛남"
 
 
 class RestaurantNoteCreate(BaseModel):
@@ -135,7 +164,6 @@ class RestaurantResponse(BaseModel):
     phone: str | None
     latitude: float | None
     longitude: float | None
-    rating_level: str
     note_count: int
     created_at: str
 

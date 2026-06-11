@@ -3,7 +3,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.core.dependencies import get_current_user
 from app.schemas import (
@@ -159,7 +159,8 @@ def list_restaurants(
     district: str | None = None,
     town: str | None = None,
     query: str | None = None,
-    rating_level: str | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
     current_user: UserResponse = Depends(get_current_user),
 ) -> list[RestaurantResponse]:
     return restaurant_store.list_restaurants(
@@ -168,7 +169,8 @@ def list_restaurants(
         district=district,
         town=town,
         query=query,
-        rating_level=rating_level,
+        limit=limit,
+        offset=offset,
     )
 
 
@@ -552,7 +554,6 @@ def _recommendations_from_kakao_places(
             phone=place.phone or None,
             latitude=latitude_value,
             longitude=longitude_value,
-            rating_level="맛남",
             note_count=0,
             created_at=created_at,
         )
@@ -852,7 +853,6 @@ def _build_fallback_recommendations(query: str, limit: int) -> list[RestaurantRe
             phone=None,
             latitude=None,
             longitude=None,
-            rating_level="맛남",
             note_count=0,
             created_at=created_at,
         )
