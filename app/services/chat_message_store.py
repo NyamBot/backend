@@ -43,23 +43,40 @@ class OpenSearchChatMessageStore:
         self._client.index(index=self.index_name, id=message_id, body=document, refresh=True)
         return self._message_from_document(document)
 
-    def list_messages(self, user_id: str | None) -> list[TasteAgentMessage]:
+    def list_messages(
+        self,
+        user_id: str | None,
+        session_id: str | None = None,
+        session_ids: list[str] | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[TasteAgentMessage], bool]:
         self._ensure_index()
-        query: dict[str, Any]
+        filters: list[dict[str, Any]] = []
         if user_id:
-            query = {"term": {"user_id": user_id}}
+            filters.append({"term": {"user_id": user_id}})
+        if session_id:
+            filters.append({"term": {"session_id": session_id}})
+        if session_ids:
+            filters.append({"terms": {"session_id": session_ids}})
+
+        if filters:
+            query: dict[str, Any] = {"bool": {"filter": filters}}
         else:
             query = {"match_all": {}}
+        page_size = max(limit, 0) + 1
         response = self._client.search(
             index=self.index_name,
             body={
                 "query": query,
                 "sort": [{"created_at": {"order": "asc"}}],
-                "size": 1000,
+                "from": max(offset, 0),
+                "size": page_size,
             },
         )
         hits = response.get("hits", {}).get("hits", [])
-        return [self._message_from_document(hit["_source"]) for hit in hits]
+        messages = [self._message_from_document(hit["_source"]) for hit in hits[:limit]]
+        return messages, len(hits) > limit
 
     def delete_user_messages(self, user_id: str) -> None:
         self._ensure_index()

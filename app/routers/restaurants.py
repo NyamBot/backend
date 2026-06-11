@@ -307,6 +307,18 @@ def _run_chat(
     session_id: str,
     request_id: str,
 ) -> RestaurantChatResponse:
+    request_metadata = _chat_request_metadata(
+        payload=payload,
+        request_id=request_id,
+        location_criteria=location_criteria,
+        requested_area=requested_area,
+        area_filter=area_filter,
+    )
+    restaurant_store.save_message(session_id, current_user.id, "user", query, [], request_metadata)
+
+    if chat_cancel_store.is_cancelled(request_id):
+        return _cancelled_chat_response(session_id, request_id)
+
     recommendations = restaurant_store.recommend(
         query=query,
         user_id=current_user.id,
@@ -320,6 +332,10 @@ def _run_chat(
     )
     has_saved_restaurants = bool(restaurant_store.list_restaurants(user_id=current_user.id))
     used_nearby_fallback = False
+
+    if chat_cancel_store.is_cancelled(request_id):
+        return _cancelled_chat_response(session_id, request_id)
+
     if location_criteria and len(recommendations) < MAX_AI_CANDIDATES:
         area_recommendations = _build_kakao_area_recommendations(
             query=query,
@@ -330,6 +346,8 @@ def _run_chat(
         if area_recommendations:
             recommendations = _merge_recommendations(recommendations, area_recommendations, MAX_AI_CANDIDATES)
             used_nearby_fallback = True
+        if chat_cancel_store.is_cancelled(request_id):
+            return _cancelled_chat_response(session_id, request_id)
     elif payload.latitude is not None and payload.longitude is not None and not _has_nearby_saved_recommendation(
         recommendations,
         payload.latitude,
@@ -346,9 +364,15 @@ def _run_chat(
         if nearby_recommendations:
             recommendations = _merge_recommendations(recommendations, nearby_recommendations, MAX_AI_CANDIDATES)
             used_nearby_fallback = True
+        if chat_cancel_store.is_cancelled(request_id):
+            return _cancelled_chat_response(session_id, request_id)
     if not recommendations and not has_saved_restaurants:
         recommendations = _build_fallback_recommendations(query, effective_limit)
     recommendations = recommendations[:MAX_AI_CANDIDATES]
+
+    if chat_cancel_store.is_cancelled(request_id):
+        return _cancelled_chat_response(session_id, request_id)
+
     rerank_error: str | None = None
     try:
         reranked_recommendations = huggingface_chat_service.rerank_restaurant_candidates(
@@ -367,6 +391,10 @@ def _run_chat(
         recommendations = _apply_ai_rerank(recommendations, reranked_recommendations, effective_limit)
     else:
         recommendations = recommendations[:effective_limit]
+
+    if chat_cancel_store.is_cancelled(request_id):
+        return _cancelled_chat_response(session_id, request_id)
+
     context = [
         evidence
         for recommendation in recommendations
@@ -385,41 +413,17 @@ def _run_chat(
     except HuggingFaceChatError as error:
         ai_answer = None
         ai_error = str(error)
+
+    if chat_cancel_store.is_cancelled(request_id):
+        return _cancelled_chat_response(session_id, request_id)
+
     if ai_answer:
         answer = ai_answer
         answer_provider = f"huggingface:{huggingface_chat_service.model}"
     else:
         answer = _build_answer(query, recommendations, fallback=not has_saved_restaurants or used_nearby_fallback)
-    request_metadata = {
-        "request_id": request_id,
-        "area": requested_area,
-        "area_filter": area_filter,
-        "location_criteria": {
-            "city": location_criteria.city,
-            "district": location_criteria.district,
-            "neighborhood": location_criteria.neighborhood,
-        }
-        if location_criteria
-        else None,
-        "requested_area_source": "payload" if payload.area else ("query" if requested_area else None),
-        "cuisine": payload.cuisine,
-        "price_level": payload.price_level,
-        "tags": payload.tags,
-        "latitude": payload.latitude,
-        "longitude": payload.longitude,
-        "limit": payload.limit,
-    }
-    restaurant_store.save_message(session_id, current_user.id, "user", query, [], request_metadata)
     if chat_cancel_store.is_cancelled(request_id):
-        restaurant_store.touch_chat_session(session_id)
-        return RestaurantChatResponse(
-            session_id=session_id,
-            request_id=request_id,
-            cancelled=True,
-            answer="응답 생성을 중지했어요.",
-            recommendations=[],
-            context=[],
-        )
+        return _cancelled_chat_response(session_id, request_id)
     restaurant_store.save_message(
         session_id,
         current_user.id,
@@ -447,6 +451,46 @@ def _run_chat(
     )
 
 
+def _chat_request_metadata(
+    payload: RestaurantChatRequest,
+    request_id: str,
+    location_criteria: LocationCriteria | None,
+    requested_area: str | None,
+    area_filter: str | None,
+) -> dict[str, object]:
+    return {
+        "request_id": request_id,
+        "area": requested_area,
+        "area_filter": area_filter,
+        "location_criteria": {
+            "city": location_criteria.city,
+            "district": location_criteria.district,
+            "neighborhood": location_criteria.neighborhood,
+        }
+        if location_criteria
+        else None,
+        "requested_area_source": "payload" if payload.area else ("query" if requested_area else None),
+        "cuisine": payload.cuisine,
+        "price_level": payload.price_level,
+        "tags": payload.tags,
+        "latitude": payload.latitude,
+        "longitude": payload.longitude,
+        "limit": payload.limit,
+    }
+
+
+def _cancelled_chat_response(session_id: str, request_id: str) -> RestaurantChatResponse:
+    restaurant_store.touch_chat_session(session_id)
+    return RestaurantChatResponse(
+        session_id=session_id,
+        request_id=request_id,
+        cancelled=True,
+        answer="응답 생성을 중지했어요.",
+        recommendations=[],
+        context=[],
+    )
+
+
 @router.post("/chat/cancel", response_model=RestaurantChatCancelResponse)
 def cancel_chat(
     payload: RestaurantChatCancelRequest,
@@ -467,19 +511,59 @@ def cancel_chat(
 
 
 @router.get("/chat/messages", response_model=TasteAgentMessagesResponse)
-def list_messages(current_user: UserResponse = Depends(get_current_user)) -> TasteAgentMessagesResponse:
+def list_messages(
+    session_id: str | None = None,
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    current_user: UserResponse = Depends(get_current_user),
+) -> TasteAgentMessagesResponse:
+    messages, has_more = restaurant_store.list_messages(
+        current_user.id,
+        session_id=session_id,
+        limit=limit,
+        offset=offset,
+    )
     return TasteAgentMessagesResponse(
         user_id=current_user.id,
-        messages=restaurant_store.list_messages(current_user.id),
+        messages=messages,
+        limit=limit,
+        offset=offset,
+        has_more=has_more,
     )
 
 
 @router.get("/chat/sessions", response_model=TasteAgentSessionsResponse)
-def list_sessions(current_user: UserResponse = Depends(get_current_user)) -> TasteAgentSessionsResponse:
+def list_sessions(
+    session_id: str | None = None,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    current_user: UserResponse = Depends(get_current_user),
+) -> TasteAgentSessionsResponse:
+    sessions, has_more = restaurant_store.list_sessions(
+        current_user.id,
+        limit=limit,
+        offset=offset,
+        session_id=session_id,
+    )
     return TasteAgentSessionsResponse(
         user_id=current_user.id,
-        sessions=restaurant_store.list_sessions(current_user.id),
+        sessions=sessions,
+        limit=limit,
+        offset=offset,
+        has_more=has_more,
     )
+
+
+@router.delete("/chat/sessions/{session_id}", status_code=204)
+def delete_chat_session(
+    session_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+) -> None:
+    if session_id == "legacy":
+        raise HTTPException(status_code=400, detail="Legacy chat history cannot be deleted from here")
+    deleted = restaurant_store.soft_delete_chat_session(current_user.id, session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Chat session not found")
 
 
 @router.get("/{restaurant_id}", response_model=RestaurantResponse)

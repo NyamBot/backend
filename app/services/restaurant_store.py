@@ -172,7 +172,8 @@ class SqliteRestaurantStore:
                     user_id TEXT,
                     title TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    deleted_at TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_taste_agent_sessions_user_id
@@ -220,6 +221,7 @@ class SqliteRestaurantStore:
                 "ALTER TABLE restaurants ADD COLUMN town TEXT",
                 "ALTER TABLE taste_agent_messages ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
                 "ALTER TABLE taste_agent_messages ADD COLUMN session_id TEXT REFERENCES taste_agent_sessions(id) ON DELETE CASCADE",
+                "ALTER TABLE taste_agent_sessions ADD COLUMN deleted_at TEXT",
                 "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'",
                 "ALTER TABLE users ADD COLUMN level_key TEXT NOT NULL DEFAULT 'egg'",
                 "ALTER TABLE users ADD COLUMN level_points INTEGER NOT NULL DEFAULT 0",
@@ -710,7 +712,7 @@ class SqliteRestaurantStore:
         if session_id:
             with self._connect() as connection:
                 row = connection.execute(
-                    "SELECT id FROM taste_agent_sessions WHERE id = ? AND user_id = ?",
+                    "SELECT id FROM taste_agent_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
                     (session_id, user_id),
                 ).fetchone()
             if row:
@@ -726,9 +728,23 @@ class SqliteRestaurantStore:
                 (session_id,),
             )
 
-    def list_messages(self, user_id: str | None) -> list[TasteAgentMessage]:
-        where_clause = "WHERE user_id = ?" if user_id else ""
-        params = (user_id,) if user_id else ()
+    def list_messages(
+        self,
+        user_id: str | None,
+        session_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[TasteAgentMessage], bool]:
+        clauses = []
+        params: list[Any] = []
+        if user_id:
+            clauses.append("user_id = ?")
+            params.append(user_id)
+        if session_id:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        where_clause = "WHERE " + " AND ".join(clauses) if clauses else ""
+        params.extend([limit + 1, offset])
         with self._connect() as connection:
             rows = connection.execute(
                 f"""
@@ -736,30 +752,56 @@ class SqliteRestaurantStore:
                 FROM taste_agent_messages
                 {where_clause}
                 ORDER BY created_at ASC
+                LIMIT ? OFFSET ?
                 """,
-                params,
+                tuple(params),
             ).fetchall()
-        return [self._message_from_row(row) for row in rows]
+        return [self._message_from_row(row) for row in rows[:limit]], len(rows) > limit
 
-    def list_sessions(self, user_id: str | None) -> list[TasteAgentSession]:
-        messages = self.list_messages(user_id)
+    def list_sessions(
+        self,
+        user_id: str | None,
+        limit: int = 20,
+        offset: int = 0,
+        session_id: str | None = None,
+    ) -> tuple[list[TasteAgentSession], bool]:
+        clauses = ["user_id = ?"]
+        params: list[Any] = [user_id]
+        if session_id:
+            clauses.append("id = ?")
+            params.append(session_id)
+        params.extend([limit + 1, offset])
         with self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT id, user_id, title, created_at, updated_at
                 FROM taste_agent_sessions
-                WHERE user_id = ?
+                WHERE {" AND ".join(clauses)} AND deleted_at IS NULL
                 ORDER BY updated_at DESC
+                LIMIT ? OFFSET ?
                 """,
-                (user_id,),
+                tuple(params),
             ).fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        session_messages: dict[str, list[TasteAgentMessage]] = {}
+        for row in rows:
+            messages, _ = self.list_messages(user_id, session_id=row["id"], limit=1000)
+            session_messages[str(row["id"])] = messages
 
         grouped: dict[str, list[TasteAgentMessage]] = {}
         legacy_messages: list[TasteAgentMessage] = []
-        for message in messages:
-            if message.session_id:
-                grouped.setdefault(message.session_id, []).append(message)
-            else:
+        for messages in session_messages.values():
+            for message in messages:
+                if message.session_id:
+                    grouped.setdefault(message.session_id, []).append(message)
+                else:
+                    legacy_messages.append(message)
+        if not session_id and offset == 0:
+            messages, _ = self.list_messages(user_id, session_id=None, limit=1000)
+            for message in messages:
+                if message.session_id:
+                    continue
                 legacy_messages.append(message)
 
         sessions = [
@@ -784,7 +826,19 @@ class SqliteRestaurantStore:
                     messages=legacy_messages,
                 )
             )
-        return sessions
+        return sessions, has_more
+
+    def soft_delete_chat_session(self, user_id: str | None, session_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE taste_agent_sessions
+                SET deleted_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ? AND deleted_at IS NULL
+                """,
+                (session_id, user_id),
+            )
+            return cursor.rowcount > 0
 
     def _restaurant_from_row(self, row: Any) -> RestaurantResponse:
         return RestaurantResponse(
@@ -909,10 +963,12 @@ class PgRestaurantStore(SqliteRestaurantStore):
                         user_id TEXT,
                         title TEXT NOT NULL,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        deleted_at TIMESTAMPTZ
                     )
                     """
                 )
+                cursor.execute("ALTER TABLE taste_agent_sessions ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_taste_agent_sessions_user_id ON taste_agent_sessions(user_id)")
                 cursor.execute(
                     """
@@ -1530,7 +1586,7 @@ class PgRestaurantStore(SqliteRestaurantStore):
             with self._connect() as connection:
                 with connection.cursor(row_factory=self.dict_row) as cursor:
                     cursor.execute(
-                        "SELECT id FROM taste_agent_sessions WHERE id = %s AND user_id = %s",
+                        "SELECT id FROM taste_agent_sessions WHERE id = %s AND user_id = %s AND deleted_at IS NULL",
                         (session_id, user_id),
                     )
                     row = cursor.fetchone()
@@ -1547,9 +1603,23 @@ class PgRestaurantStore(SqliteRestaurantStore):
                 )
             connection.commit()
 
-    def list_messages(self, user_id: str | None) -> list[TasteAgentMessage]:
-        where_clause = "WHERE user_id = %s" if user_id else ""
-        params = (user_id,) if user_id else ()
+    def list_messages(
+        self,
+        user_id: str | None,
+        session_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[TasteAgentMessage], bool]:
+        clauses = []
+        params: list[Any] = []
+        if user_id:
+            clauses.append("user_id = %s")
+            params.append(user_id)
+        if session_id:
+            clauses.append("session_id = %s")
+            params.append(session_id)
+        where_clause = "WHERE " + " AND ".join(clauses) if clauses else ""
+        params.extend([limit + 1, offset])
         with self._connect() as connection:
             with connection.cursor(row_factory=self.dict_row) as cursor:
                 cursor.execute(
@@ -1559,33 +1629,59 @@ class PgRestaurantStore(SqliteRestaurantStore):
                     FROM taste_agent_messages
                     {where_clause}
                     ORDER BY created_at ASC
+                    LIMIT %s OFFSET %s
                     """,
-                    params,
+                    tuple(params),
                 )
                 rows = cursor.fetchall()
-        return [self._message_from_row(row) for row in rows]
+        return [self._message_from_row(row) for row in rows[:limit]], len(rows) > limit
 
-    def list_sessions(self, user_id: str | None) -> list[TasteAgentSession]:
-        messages = self.list_messages(user_id)
+    def list_sessions(
+        self,
+        user_id: str | None,
+        limit: int = 20,
+        offset: int = 0,
+        session_id: str | None = None,
+    ) -> tuple[list[TasteAgentSession], bool]:
+        clauses = ["user_id = %s"]
+        params: list[Any] = [user_id]
+        if session_id:
+            clauses.append("id = %s")
+            params.append(session_id)
+        params.extend([limit + 1, offset])
         with self._connect() as connection:
             with connection.cursor(row_factory=self.dict_row) as cursor:
                 cursor.execute(
-                    """
+                    f"""
                     SELECT id, user_id, title, created_at::text AS created_at, updated_at::text AS updated_at
                     FROM taste_agent_sessions
-                    WHERE user_id = %s
+                    WHERE {" AND ".join(clauses)} AND deleted_at IS NULL
                     ORDER BY updated_at DESC
+                    LIMIT %s OFFSET %s
                     """,
-                    (user_id,),
+                    tuple(params),
                 )
                 rows = cursor.fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        session_messages: dict[str, list[TasteAgentMessage]] = {}
+        for row in rows:
+            messages, _ = self.list_messages(user_id, session_id=row["id"], limit=1000)
+            session_messages[str(row["id"])] = messages
 
         grouped: dict[str, list[TasteAgentMessage]] = {}
         legacy_messages: list[TasteAgentMessage] = []
-        for message in messages:
-            if message.session_id:
-                grouped.setdefault(message.session_id, []).append(message)
-            else:
+        for messages in session_messages.values():
+            for message in messages:
+                if message.session_id:
+                    grouped.setdefault(message.session_id, []).append(message)
+                else:
+                    legacy_messages.append(message)
+        if not session_id and offset == 0:
+            messages, _ = self.list_messages(user_id, session_id=None, limit=1000)
+            for message in messages:
+                if message.session_id:
+                    continue
                 legacy_messages.append(message)
 
         sessions = [
@@ -1610,7 +1706,22 @@ class PgRestaurantStore(SqliteRestaurantStore):
                     messages=legacy_messages,
                 )
             )
-        return sessions
+        return sessions, has_more
+
+    def soft_delete_chat_session(self, user_id: str | None, session_id: str) -> bool:
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE taste_agent_sessions
+                    SET deleted_at = NOW()
+                    WHERE id = %s AND user_id = %s AND deleted_at IS NULL
+                    """,
+                    (session_id, user_id),
+                )
+                deleted = cursor.rowcount > 0
+            connection.commit()
+        return deleted
 
 
 class RestaurantStore:
@@ -1732,13 +1843,19 @@ class RestaurantStore:
                 self.chat_message_error = str(error)
         return self.backend.save_message(session_id, user_id, role, content, retrieved_context, metadata)
 
-    def list_messages(self, user_id: str | None) -> list[TasteAgentMessage]:
+    def list_messages(
+        self,
+        user_id: str | None,
+        session_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[TasteAgentMessage], bool]:
         if chat_message_store.enabled:
             try:
-                return chat_message_store.list_messages(user_id)
+                return chat_message_store.list_messages(user_id, session_id=session_id, limit=limit, offset=offset)
             except Exception as error:
                 self.chat_message_error = str(error)
-        return self.backend.list_messages(user_id)
+        return self.backend.list_messages(user_id, session_id=session_id, limit=limit, offset=offset)
 
     def ensure_chat_session(self, user_id: str | None, session_id: str | None, title: str) -> str:
         return self.backend.ensure_chat_session(user_id, session_id, title)
@@ -1746,15 +1863,22 @@ class RestaurantStore:
     def touch_chat_session(self, session_id: str) -> None:
         self.backend.touch_chat_session(session_id)
 
-    def list_sessions(self, user_id: str | None) -> list[TasteAgentSession]:
-        sessions = self.backend.list_sessions(user_id)
+    def list_sessions(
+        self,
+        user_id: str | None,
+        limit: int = 20,
+        offset: int = 0,
+        session_id: str | None = None,
+    ) -> tuple[list[TasteAgentSession], bool]:
+        sessions, has_more = self.backend.list_sessions(user_id, limit=limit, offset=offset, session_id=session_id)
         if not chat_message_store.enabled:
-            return sessions
+            return sessions, has_more
         try:
-            messages = chat_message_store.list_messages(user_id)
+            session_ids = [session.id for session in sessions if session.id != "legacy"]
+            messages, _ = chat_message_store.list_messages(user_id, session_ids=session_ids, limit=1000)
         except Exception as error:
             self.chat_message_error = str(error)
-            return sessions
+            return sessions, has_more
 
         grouped: dict[str, list[TasteAgentMessage]] = {}
         legacy_messages: list[TasteAgentMessage] = []
@@ -1780,7 +1904,10 @@ class RestaurantStore:
                     messages=legacy_messages,
                 )
             )
-        return refreshed_sessions
+        return refreshed_sessions, has_more
+
+    def soft_delete_chat_session(self, user_id: str | None, session_id: str) -> bool:
+        return self.backend.soft_delete_chat_session(user_id, session_id)
 
 
 restaurant_store = RestaurantStore()

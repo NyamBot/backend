@@ -245,8 +245,14 @@ class TasteAgentSession(BaseModel):
 class TasteAgentMessagesResponse(BaseModel):
     user_id: str | None
     messages: list[TasteAgentMessage]
+    limit: int
+    offset: int
+    has_more: bool
 
 
 class TasteAgentSessionsResponse(BaseModel):
     user_id: str | None
     sessions: list[TasteAgentSession]
+    limit: int
+    offset: int
+    has_more: bool
