@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import re
 from typing import Any
@@ -12,6 +13,12 @@ from app.schemas import RestaurantRecommendation
 
 class HuggingFaceChatError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class RestaurantChatCompletion:
+    answer: str
+    title: str | None = None
 
 
 class HuggingFaceChatService:
@@ -35,7 +42,7 @@ class HuggingFaceChatService:
         fallback: bool,
         requested_area: str | None = None,
         area_filter: str | None = None,
-    ) -> str | None:
+    ) -> RestaurantChatCompletion | None:
         if not self.configured:
             return None
 
@@ -53,6 +60,16 @@ class HuggingFaceChatService:
                         "카카오 장소 검색 후보는 저장된 기록이 있다고 표현하지 마. "
                         "한국어로 짧고 친근하게 답해. "
                         "Markdown 문법을 쓰지 마. 별표, 굵은 글씨, 이모지는 사용하지 마."
+                    ),
+                },
+                {
+                    "role": "system",
+                    "content": (
+                        'Return only JSON in this exact shape: {"answer":"...","title":"..."}. '
+                        "The title must be Korean, natural, and under 24 characters. "
+                        "Make the title a short topic phrase, not a copied user command. "
+                        "Avoid request verbs like 찾아줘, 추천해줘, 골라줘, 알려줘. "
+                        "Do not wrap the JSON in Markdown."
                     ),
                 },
                 {
@@ -86,7 +103,7 @@ class HuggingFaceChatService:
             answer = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as error:
             raise HuggingFaceChatError("Hugging Face chat response format is invalid") from error
-        return self._clean_answer(str(answer)) or None
+        return self._parse_answer_response(str(answer))
 
     def rerank_restaurant_candidates(
         self,
@@ -303,6 +320,28 @@ class HuggingFaceChatService:
             raise HuggingFaceChatError("Hugging Face rerank response has no ranked_candidates")
         return [item for item in ranked if isinstance(item, dict)]
 
+    def _parse_answer_response(self, content: str) -> RestaurantChatCompletion | None:
+        stripped = content.strip()
+        if stripped.startswith("```"):
+            stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+            stripped = re.sub(r"\s*```$", "", stripped)
+
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            answer = self._clean_answer(content)
+            return RestaurantChatCompletion(answer=answer) if answer else None
+
+        if not isinstance(parsed, dict):
+            answer = self._clean_answer(content)
+            return RestaurantChatCompletion(answer=answer) if answer else None
+
+        answer = self._clean_answer(str(parsed.get("answer") or ""))
+        if not answer:
+            return None
+        title = self._clean_title(str(parsed.get("title") or ""))
+        return RestaurantChatCompletion(answer=answer, title=title)
+
     def _clean_answer(self, answer: str) -> str:
         return (
             answer.replace("**", "")
@@ -310,6 +349,12 @@ class HuggingFaceChatService:
             .replace("*", "")
             .strip()
         )
+
+    def _clean_title(self, title: str) -> str | None:
+        cleaned = re.sub(r"\s+", " ", title).strip(" \t\r\n\"'`")
+        if not cleaned:
+            return None
+        return cleaned[:24]
 
 
 huggingface_chat_service = HuggingFaceChatService()

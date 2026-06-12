@@ -159,9 +159,11 @@ def create_restaurant(
 
 @router.get("", response_model=list[RestaurantResponse])
 def list_restaurants(
-    city: str | None = None,
-    district: str | None = None,
-    town: str | None = None,
+    city: list[str] | None = Query(default=None),
+    district: list[str] | None = Query(default=None),
+    town: list[str] | None = Query(default=None),
+    cuisine: list[str] | None = Query(default=None),
+    price_level: list[str] | None = Query(default=None),
     query: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
@@ -172,6 +174,8 @@ def list_restaurants(
         city=city,
         district=district,
         town=town,
+        cuisine=cuisine,
+        price_level=price_level,
         query=query,
         limit=limit,
         offset=offset,
@@ -287,11 +291,13 @@ def chat(
     requested_area = location_criteria.display if location_criteria else None
     area_filter = location_criteria.store_area if location_criteria else None
     effective_limit = max(payload.limit, MIN_CHAT_RECOMMENDATIONS)
-    session_id = restaurant_store.ensure_chat_session(current_user.id, payload.session_id, query)
+    should_update_session_title = payload.session_id is None
+    initial_title = _build_chat_session_title(query, requested_area)
+    session_id = restaurant_store.ensure_chat_session(current_user.id, payload.session_id, initial_title)
     request_id = payload.request_id or str(uuid4())
     chat_cancel_store.register(current_user.id, session_id, request_id)
     try:
-        return _run_chat(payload, current_user, query, location_criteria, requested_area, area_filter, effective_limit, session_id, request_id)
+        return _run_chat(payload, current_user, query, location_criteria, requested_area, area_filter, effective_limit, session_id, request_id, should_update_session_title)
     finally:
         chat_cancel_store.complete(request_id)
 
@@ -306,6 +312,7 @@ def _run_chat(
     effective_limit: int,
     session_id: str,
     request_id: str,
+    should_update_session_title: bool,
 ) -> RestaurantChatResponse:
     request_metadata = _chat_request_metadata(
         payload=payload,
@@ -323,8 +330,8 @@ def _run_chat(
         query=query,
         user_id=current_user.id,
         area=area_filter,
-        cuisine=payload.cuisine,
-        price_level=payload.price_level,
+        cuisine=None,
+        price_level=None,
         tags=payload.tags,
         latitude=payload.latitude,
         longitude=payload.longitude,
@@ -339,7 +346,7 @@ def _run_chat(
     if location_criteria and len(recommendations) < MAX_AI_CANDIDATES:
         area_recommendations = _build_kakao_area_recommendations(
             query=query,
-            cuisine=payload.cuisine,
+            cuisine=None,
             location_criteria=location_criteria,
             limit=MAX_AI_CANDIDATES,
         )
@@ -356,7 +363,7 @@ def _run_chat(
     ):
         nearby_recommendations = _build_kakao_nearby_recommendations(
             query=query,
-            cuisine=payload.cuisine,
+            cuisine=None,
             latitude=payload.latitude,
             longitude=payload.longitude,
             limit=MAX_AI_CANDIDATES,
@@ -402,8 +409,9 @@ def _run_chat(
     ]
     answer_provider = "template"
     ai_error: str | None = None
+    ai_session_title: str | None = None
     try:
-        ai_answer = huggingface_chat_service.generate_restaurant_answer(
+        ai_completion = huggingface_chat_service.generate_restaurant_answer(
             query,
             recommendations,
             fallback=not has_saved_restaurants or used_nearby_fallback,
@@ -411,17 +419,20 @@ def _run_chat(
             area_filter=area_filter,
         )
     except HuggingFaceChatError as error:
-        ai_answer = None
+        ai_completion = None
         ai_error = str(error)
 
     if chat_cancel_store.is_cancelled(request_id):
         return _cancelled_chat_response(session_id, request_id)
 
-    if ai_answer:
-        answer = ai_answer
+    if ai_completion:
+        answer = ai_completion.answer
+        ai_session_title = ai_completion.title
         answer_provider = f"huggingface:{huggingface_chat_service.model}"
     else:
         answer = _build_answer(query, recommendations, fallback=not has_saved_restaurants or used_nearby_fallback)
+    if should_update_session_title and ai_session_title:
+        restaurant_store.update_chat_session_title(current_user.id, session_id, ai_session_title)
     if chat_cancel_store.is_cancelled(request_id):
         return _cancelled_chat_response(session_id, request_id)
     restaurant_store.save_message(
@@ -436,6 +447,7 @@ def _run_chat(
             "restaurant_names": [recommendation.restaurant.name for recommendation in recommendations],
             "recommendations": [recommendation.model_dump(mode="json") for recommendation in recommendations],
             "answer_provider": answer_provider,
+            "session_title": ai_session_title,
             "ai_error": ai_error,
             "rerank_error": rerank_error,
             "used_nearby_fallback": used_nearby_fallback,
@@ -470,8 +482,6 @@ def _chat_request_metadata(
         if location_criteria
         else None,
         "requested_area_source": "payload" if payload.area else ("query" if requested_area else None),
-        "cuisine": payload.cuisine,
-        "price_level": payload.price_level,
         "tags": payload.tags,
         "latitude": payload.latitude,
         "longitude": payload.longitude,
@@ -933,6 +943,36 @@ def _distance_km(
     delta_lon = math.radians(float(right_longitude) - float(left_longitude))
     a = math.sin(delta_lat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2) ** 2
     return earth_radius_km * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _build_chat_session_title(query: str, requested_area: str | None) -> str:
+    text = re.sub(r"\s+", " ", query).strip()
+    if not text:
+        return "맛집 추천"
+
+    _ = requested_area
+    replacements = [
+        (r"(지금|오늘|내일|이번|근처에\s*있는|근처\s*있는)", " "),
+        (r"(맛집|식당|음식점)\s*(좀|추천|검색|찾기)?", "맛집"),
+        (r"(찾아줘|추천해줘|골라줘|알려줘|찾아\s*줘|추천\s*해줘|골라\s*줘|알려\s*줘)", " "),
+        (r"(해줘|해\s*줘|줘|요|요\.)$", " "),
+        (r"[?.!,~]+", " "),
+    ]
+    for pattern, replacement in replacements:
+        text = re.sub(pattern, replacement, text)
+
+    text = re.sub(r"([가-힣]{2,})하기", r"\1", text)
+    text = re.sub(r"([가-힣]{2,})(에서|으로|로)\b", r"\1", text)
+    text = re.sub(r"\b곳\b", " ", text)
+    text = re.sub(r"\b(있는|좋은|괜찮은|가까운)\b", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" -_/·")
+
+    if not text or text in {"맛집", "근처", "근처 맛집"}:
+        text = "근처 맛집 추천" if "근처" in query else "맛집 추천"
+    elif "맛집" not in text:
+        text = f"{text} 맛집"
+
+    return text[:24].strip() or "맛집 추천"
 
 
 def _build_fallback_recommendations(query: str, limit: int) -> list[RestaurantRecommendation]:

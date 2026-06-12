@@ -2,6 +2,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+TextFilter = str | list[str] | None
+
 
 class HealthResponse(BaseModel):
     status: str
@@ -174,8 +176,8 @@ class RestaurantRecommendationRequest(BaseModel):
     user_id: str | None = None
     query: str = Field(min_length=1)
     area: str | None = None
-    cuisine: str | None = None
-    price_level: str | None = None
+    cuisine: TextFilter = None
+    price_level: TextFilter = None
     tags: list[str] = []
     latitude: float | None = None
     longitude: float | None = None
@@ -196,8 +198,14 @@ class RestaurantRecommendationsResponse(BaseModel):
     recommendations: list[RestaurantRecommendation]
 
 
-class RestaurantChatRequest(RestaurantRecommendationRequest):
+class RestaurantChatRequest(BaseModel):
+    query: str = Field(min_length=1)
     message: str = Field(min_length=1)
+    area: str | None = None
+    tags: list[str] = []
+    latitude: float | None = None
+    longitude: float | None = None
+    limit: int = Field(default=3, ge=1, le=5)
     session_id: str | None = None
     request_id: str | None = None
 

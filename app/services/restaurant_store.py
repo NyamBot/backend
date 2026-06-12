@@ -37,6 +37,77 @@ USER_LEVEL_EVENT_POINTS = {
     "weekly_share": 5,
 }
 
+TextFilter = str | list[str] | tuple[str, ...] | None
+
+
+def _normalize_text_filter(value: TextFilter) -> list[str]:
+    if value is None:
+        return []
+    raw_values: list[str]
+    if isinstance(value, str):
+        raw_values = [value]
+    else:
+        raw_values = [str(item) for item in value]
+
+    normalized: list[str] = []
+    for raw_value in raw_values:
+        normalized.extend(part.strip() for part in raw_value.split(",") if part.strip())
+    return normalized
+
+
+def _filter_text(value: TextFilter) -> str:
+    return " ".join(_normalize_text_filter(value))
+
+
+def _first_filter_value(value: TextFilter) -> str | None:
+    values = _normalize_text_filter(value)
+    return values[0] if values else None
+
+
+def _append_region_filter_clause(
+    clauses: list[str],
+    params: list[Any],
+    value: TextFilter,
+    operator: str,
+    placeholder: str,
+) -> None:
+    values = _normalize_text_filter(value)
+    if not values:
+        return
+
+    columns = (
+        "restaurants.city",
+        "restaurants.district",
+        "restaurants.town",
+        "restaurants.road_address",
+        "restaurants.address",
+        "restaurants.area",
+    )
+    value_clauses = []
+    for filter_value in values:
+        value_clauses.append(
+            "(" + " OR ".join(f"{column} {operator} {placeholder}" for column in columns) + ")"
+        )
+        params.extend([f"%{filter_value}%"] * len(columns))
+    clauses.append("(" + " OR ".join(value_clauses) + ")")
+
+
+def _append_column_filter_clause(
+    clauses: list[str],
+    params: list[Any],
+    column: str,
+    value: TextFilter,
+    operator: str,
+    placeholder: str,
+    *,
+    exact: bool = False,
+) -> None:
+    values = _normalize_text_filter(value)
+    if not values:
+        return
+    clauses.append("(" + " OR ".join(f"{column} {operator} {placeholder}" for _ in values) + ")")
+    params.extend(values if exact else [f"%{item}%" for item in values])
+
 
 def _embed(text: str) -> list[float]:
     vector = [0.0] * VECTOR_DIMENSIONS
@@ -451,9 +522,11 @@ class SqliteRestaurantStore:
     def list_restaurants(
         self,
         user_id: str | None = None,
-        city: str | None = None,
-        district: str | None = None,
-        town: str | None = None,
+        city: TextFilter = None,
+        district: TextFilter = None,
+        town: TextFilter = None,
+        cuisine: TextFilter = None,
+        price_level: TextFilter = None,
         query: str | None = None,
         limit: int = 50,
         offset: int = 0,
@@ -464,18 +537,17 @@ class SqliteRestaurantStore:
             clauses.append("restaurants.user_id = ?")
             params.append(user_id)
         for value in (city, district, town):
-            if value:
-                clauses.append(
-                    """(
-                        restaurants.city LIKE ?
-                        OR restaurants.district LIKE ?
-                        OR restaurants.town LIKE ?
-                        OR restaurants.road_address LIKE ?
-                        OR restaurants.address LIKE ?
-                        OR restaurants.area LIKE ?
-                    )"""
-                )
-                params.extend([f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%"])
+            _append_region_filter_clause(clauses, params, value, "LIKE", "?")
+        _append_column_filter_clause(clauses, params, "restaurants.cuisine", cuisine, "LIKE", "?")
+        _append_column_filter_clause(
+            clauses,
+            params,
+            "restaurants.price_level",
+            price_level,
+            "=",
+            "?",
+            exact=True,
+        )
         if query:
             like = f"%{query}%"
             clauses.append(
@@ -581,17 +653,23 @@ class SqliteRestaurantStore:
         query: str,
         user_id: str | None,
         area: str | None,
-        cuisine: str | None,
-        price_level: str | None,
+        cuisine: TextFilter,
+        price_level: TextFilter,
         tags: list[str],
         latitude: float | None,
         longitude: float | None,
         limit: int,
     ) -> list[RestaurantRecommendation]:
-        query_embedding = _embed(" ".join([query, area or "", cuisine or "", price_level or "", " ".join(tags)]))
+        cuisine_text = _filter_text(cuisine)
+        price_level_text = _filter_text(price_level)
+        query_embedding = _embed(" ".join([query, area or "", cuisine_text, price_level_text, " ".join(tags)]))
         rows = self._search_note_rows(user_id, area, cuisine, price_level)
         scored: dict[str, dict[str, Any]] = {}
-        normalized_terms = {term.lower() for term in tags + [query, area or "", cuisine or "", price_level or ""] if term}
+        normalized_terms = {
+            term.lower()
+            for term in tags + [query, area or ""] + _normalize_text_filter(cuisine) + _normalize_text_filter(price_level)
+            if term
+        }
         for row in rows:
             note_tags = {tag.lower() for tag in _json_list(row["tags_json"])}
             restaurant_tags = {tag.lower() for tag in _json_list(row["mood_tags_json"])}
@@ -622,8 +700,8 @@ class SqliteRestaurantStore:
         self,
         user_id: str | None,
         area: str | None,
-        cuisine: str | None,
-        price_level: str | None,
+        cuisine: TextFilter,
+        price_level: TextFilter,
     ) -> list[sqlite3.Row]:
         clauses = []
         params: list[str] = []
@@ -633,12 +711,16 @@ class SqliteRestaurantStore:
         if area:
             clauses.append("restaurants.area LIKE ?")
             params.append(f"%{area}%")
-        if cuisine:
-            clauses.append("restaurants.cuisine LIKE ?")
-            params.append(f"%{cuisine}%")
-        if price_level:
-            clauses.append("restaurants.price_level = ?")
-            params.append(price_level)
+        _append_column_filter_clause(clauses, params, "restaurants.cuisine", cuisine, "LIKE", "?")
+        _append_column_filter_clause(
+            clauses,
+            params,
+            "restaurants.price_level",
+            price_level,
+            "=",
+            "?",
+            exact=True,
+        )
         where_clause = "WHERE " + " AND ".join(clauses) if clauses else ""
         with self._connect() as connection:
             return connection.execute(
@@ -726,6 +808,20 @@ class SqliteRestaurantStore:
             connection.execute(
                 "UPDATE taste_agent_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (session_id,),
+            )
+
+    def update_chat_session_title(self, user_id: str | None, session_id: str, title: str) -> None:
+        session_title = title[:80].strip()
+        if not session_title:
+            return
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE taste_agent_sessions
+                SET title = ?
+                WHERE id = ? AND user_id = ? AND deleted_at IS NULL
+                """,
+                (session_title, session_id, user_id),
             )
 
     def list_messages(
@@ -1256,9 +1352,11 @@ class PgRestaurantStore(SqliteRestaurantStore):
     def list_restaurants(
         self,
         user_id: str | None = None,
-        city: str | None = None,
-        district: str | None = None,
-        town: str | None = None,
+        city: TextFilter = None,
+        district: TextFilter = None,
+        town: TextFilter = None,
+        cuisine: TextFilter = None,
+        price_level: TextFilter = None,
         query: str | None = None,
         limit: int = 50,
         offset: int = 0,
@@ -1269,18 +1367,17 @@ class PgRestaurantStore(SqliteRestaurantStore):
             clauses.append("restaurants.user_id = %s")
             params.append(user_id)
         for value in (city, district, town):
-            if value:
-                clauses.append(
-                    """(
-                        restaurants.city ILIKE %s
-                        OR restaurants.district ILIKE %s
-                        OR restaurants.town ILIKE %s
-                        OR restaurants.road_address ILIKE %s
-                        OR restaurants.address ILIKE %s
-                        OR restaurants.area ILIKE %s
-                    )"""
-                )
-                params.extend([f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%"])
+            _append_region_filter_clause(clauses, params, value, "ILIKE", "%s")
+        _append_column_filter_clause(clauses, params, "restaurants.cuisine", cuisine, "ILIKE", "%s")
+        _append_column_filter_clause(
+            clauses,
+            params,
+            "restaurants.price_level",
+            price_level,
+            "=",
+            "%s",
+            exact=True,
+        )
         if query:
             like = f"%{query}%"
             clauses.append(
@@ -1396,18 +1493,24 @@ class PgRestaurantStore(SqliteRestaurantStore):
         query: str,
         user_id: str | None,
         area: str | None,
-        cuisine: str | None,
-        price_level: str | None,
+        cuisine: TextFilter,
+        price_level: TextFilter,
         tags: list[str],
         latitude: float | None,
         longitude: float | None,
         limit: int,
     ) -> list[RestaurantRecommendation]:
-        query_text = " ".join([query, area or "", cuisine or "", price_level or "", " ".join(tags)])
+        cuisine_text = _filter_text(cuisine)
+        price_level_text = _filter_text(price_level)
+        query_text = " ".join([query, area or "", cuisine_text, price_level_text, " ".join(tags)])
         query_embedding = _embedding_to_pgvector(_embed(query_text))
         rows = self._search_vector_note_rows(query_embedding, user_id, area, cuisine, price_level, limit * 8)
         scored: dict[str, dict[str, Any]] = {}
-        normalized_terms = {term.lower() for term in tags + [query, area or "", cuisine or "", price_level or ""] if term}
+        normalized_terms = {
+            term.lower()
+            for term in tags + [query, area or ""] + _normalize_text_filter(cuisine) + _normalize_text_filter(price_level)
+            if term
+        }
         for row in rows:
             note_tags = {tag.lower() for tag in _json_list(row["tags_json"])}
             restaurant_tags = {tag.lower() for tag in _json_list(row["mood_tags_json"])}
@@ -1439,8 +1542,8 @@ class PgRestaurantStore(SqliteRestaurantStore):
         query_embedding: str,
         user_id: str | None,
         area: str | None,
-        cuisine: str | None,
-        price_level: str | None,
+        cuisine: TextFilter,
+        price_level: TextFilter,
         limit: int,
     ) -> list[dict[str, Any]]:
         clauses = []
@@ -1451,12 +1554,16 @@ class PgRestaurantStore(SqliteRestaurantStore):
         if area:
             clauses.append("restaurants.area ILIKE %s")
             params.append(f"%{area}%")
-        if cuisine:
-            clauses.append("restaurants.cuisine ILIKE %s")
-            params.append(f"%{cuisine}%")
-        if price_level:
-            clauses.append("restaurants.price_level = %s")
-            params.append(price_level)
+        _append_column_filter_clause(clauses, params, "restaurants.cuisine", cuisine, "ILIKE", "%s")
+        _append_column_filter_clause(
+            clauses,
+            params,
+            "restaurants.price_level",
+            price_level,
+            "=",
+            "%s",
+            exact=True,
+        )
         where_clause = "WHERE " + " AND ".join(clauses) if clauses else ""
         params.append(max(limit, 1))
         with self._connect() as connection:
@@ -1483,8 +1590,8 @@ class PgRestaurantStore(SqliteRestaurantStore):
         self,
         user_id: str | None,
         area: str | None,
-        cuisine: str | None,
-        price_level: str | None,
+        cuisine: TextFilter,
+        price_level: TextFilter,
     ) -> list[dict[str, Any]]:
         clauses = []
         params: list[str] = []
@@ -1494,12 +1601,16 @@ class PgRestaurantStore(SqliteRestaurantStore):
         if area:
             clauses.append("restaurants.area ILIKE %s")
             params.append(f"%{area}%")
-        if cuisine:
-            clauses.append("restaurants.cuisine ILIKE %s")
-            params.append(f"%{cuisine}%")
-        if price_level:
-            clauses.append("restaurants.price_level = %s")
-            params.append(price_level)
+        _append_column_filter_clause(clauses, params, "restaurants.cuisine", cuisine, "ILIKE", "%s")
+        _append_column_filter_clause(
+            clauses,
+            params,
+            "restaurants.price_level",
+            price_level,
+            "=",
+            "%s",
+            exact=True,
+        )
         where_clause = "WHERE " + " AND ".join(clauses) if clauses else ""
         with self._connect() as connection:
             with connection.cursor(row_factory=self.dict_row) as cursor:
@@ -1600,6 +1711,22 @@ class PgRestaurantStore(SqliteRestaurantStore):
                 cursor.execute(
                     "UPDATE taste_agent_sessions SET updated_at = NOW() WHERE id = %s",
                     (session_id,),
+                )
+            connection.commit()
+
+    def update_chat_session_title(self, user_id: str | None, session_id: str, title: str) -> None:
+        session_title = title[:80].strip()
+        if not session_title:
+            return
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE taste_agent_sessions
+                    SET title = %s
+                    WHERE id = %s AND user_id = %s AND deleted_at IS NULL
+                    """,
+                    (session_title, session_id, user_id),
                 )
             connection.commit()
 
@@ -1795,14 +1922,16 @@ class RestaurantStore:
     def list_restaurants(
         self,
         user_id: str | None = None,
-        city: str | None = None,
-        district: str | None = None,
-        town: str | None = None,
+        city: TextFilter = None,
+        district: TextFilter = None,
+        town: TextFilter = None,
+        cuisine: TextFilter = None,
+        price_level: TextFilter = None,
         query: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[RestaurantResponse]:
-        return self.backend.list_restaurants(user_id, city, district, town, query, limit, offset)
+        return self.backend.list_restaurants(user_id, city, district, town, cuisine, price_level, query, limit, offset)
 
     def get_restaurant(self, restaurant_id: str) -> RestaurantResponse | None:
         return self.backend.get_restaurant(restaurant_id)
@@ -1818,8 +1947,8 @@ class RestaurantStore:
         query: str,
         user_id: str | None,
         area: str | None,
-        cuisine: str | None,
-        price_level: str | None,
+        cuisine: TextFilter,
+        price_level: TextFilter,
         tags: list[str],
         latitude: float | None,
         longitude: float | None,
@@ -1862,6 +1991,9 @@ class RestaurantStore:
 
     def touch_chat_session(self, session_id: str) -> None:
         self.backend.touch_chat_session(session_id)
+
+    def update_chat_session_title(self, user_id: str | None, session_id: str, title: str) -> None:
+        self.backend.update_chat_session_title(user_id, session_id, title)
 
     def list_sessions(
         self,
