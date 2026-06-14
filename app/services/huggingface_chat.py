@@ -21,11 +21,21 @@ class RestaurantChatCompletion:
     title: str | None = None
 
 
+@dataclass(frozen=True)
+class RerankCandidate:
+    candidate_id: str
+    text: str
+
+
 class HuggingFaceChatService:
     def __init__(self) -> None:
         self.base_url = settings.huggingface_chat_base_url.rstrip("/")
         self.model = settings.huggingface_chat_model
         self.timeout_seconds = settings.huggingface_chat_timeout_seconds
+        self.rerank_enabled = settings.huggingface_rerank_enabled
+        self.rerank_base_url = settings.huggingface_rerank_base_url.rstrip("/")
+        self.rerank_model = settings.huggingface_rerank_model
+        self.rerank_timeout_seconds = settings.huggingface_rerank_timeout_seconds
 
     @property
     def api_token(self) -> str | None:
@@ -115,48 +125,27 @@ class HuggingFaceChatService:
         longitude: float | None = None,
         limit: int = 3,
     ) -> list[dict[str, Any]]:
-        if not self.configured or not recommendations:
+        if not self.configured or not self.rerank_enabled or not recommendations:
             return []
 
+        candidates = self._build_rerank_candidates(recommendations)
+        rerank_query = self._build_rerank_query(query, requested_area, area_filter, latitude, longitude)
         payload = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "너는 맛집 후보를 재정렬하는 랭킹 에이전트야. "
-                        "반드시 후보 목록 안에서만 고르고, 후보 밖 식당은 만들지 마. "
-                        "사용자 발화의 숨은 의도를 분석해서 후보를 고르되, 지역 조건은 반드시 지켜. "
-                        "현재 위치와 후보별 거리 정보가 있으면 가까운 후보를 더 유리하게 봐. "
-                        "응답은 설명 문장 없이 JSON 객체 하나만 반환해."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": self._build_rerank_prompt(
-                        query,
-                        recommendations,
-                        requested_area,
-                        area_filter,
-                        latitude,
-                        longitude,
-                        limit,
-                    ),
-                },
-            ],
-            "temperature": 0.1,
-            "max_tokens": 900,
+            "inputs": [
+                {"text": rerank_query, "text_pair": candidate.text}
+                for candidate in candidates
+            ]
         }
 
         try:
             response = httpx.post(
-                f"{self.base_url}/chat/completions",
+                f"{self.rerank_base_url}/{self.rerank_model}",
                 headers={
                     "Authorization": f"Bearer {self.api_token}",
                     "Content-Type": "application/json",
                 },
                 json=payload,
-                timeout=self.timeout_seconds,
+                timeout=self.rerank_timeout_seconds,
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as error:
@@ -165,12 +154,7 @@ class HuggingFaceChatService:
         except httpx.HTTPError as error:
             raise HuggingFaceChatError(str(error)) from error
 
-        data = response.json()
-        try:
-            content = str(data["choices"][0]["message"]["content"])
-        except (KeyError, IndexError, TypeError) as error:
-            raise HuggingFaceChatError("Hugging Face rerank response format is invalid") from error
-        return self._parse_rerank_response(content)
+        return self._parse_rerank_scores(response.json(), candidates, limit)
 
     def _build_prompt(
         self,
@@ -239,86 +223,159 @@ class HuggingFaceChatService:
         )
         return "\n".join(lines)
 
-    def _build_rerank_prompt(
+    def _build_rerank_query(
         self,
         query: str,
-        recommendations: list[RestaurantRecommendation],
         requested_area: str | None,
         area_filter: str | None,
         latitude: float | None,
         longitude: float | None,
-        limit: int,
     ) -> str:
+        location = (
+            f"현재 위치 위도 {latitude}, 경도 {longitude}"
+            if latitude is not None and longitude is not None
+            else "현재 위치 없음"
+        )
+        return (
+            f"사용자 맛집 추천 요청: {query}\n"
+            f"요청 지역: {requested_area or '명시 없음'}\n"
+            f"백엔드 지역 필터: {area_filter or '없음'}\n"
+            f"{location}\n"
+            "식사 의도, 음식 종류, 분위기, 가격대, 지역 일치, 거리 정보를 기준으로 가장 관련 있는 식당 후보를 골라줘. "
+            "사용자가 카페를 직접 요청하지 않았다면 밥집/식사 후보를 더 관련 있게 봐줘."
+        )
+
+    def _build_rerank_candidates(
+        self,
+        recommendations: list[RestaurantRecommendation],
+    ) -> list[RerankCandidate]:
         candidates = []
-        for index, recommendation in enumerate(recommendations, start=1):
+        for recommendation in recommendations:
             restaurant = recommendation.restaurant
             source_type = "kakao" if restaurant.id.startswith("kakao-") or restaurant.note_count == 0 else "saved"
-            candidates.append(
-                {
-                    "candidate_id": restaurant.id,
-                    "index": index,
-                    "source": source_type,
-                    "name": restaurant.name,
-                    "area": restaurant.area,
-                    "cuisine": restaurant.cuisine,
-                    "price_level": restaurant.price_level,
-                    "mood_tags": restaurant.mood_tags,
-                    "address": restaurant.road_address or restaurant.address,
-                    "latitude": restaurant.latitude,
-                    "longitude": restaurant.longitude,
-                    "note_count": restaurant.note_count,
-                    "evidence": recommendation.evidence,
-                    "base_score": recommendation.score,
-                }
+            evidence = " / ".join(recommendation.evidence) or "근거 기록 없음"
+            address = restaurant.road_address or restaurant.address or "주소 없음"
+            text = "\n".join(
+                [
+                    f"식당명: {restaurant.name}",
+                    f"출처: {source_type}",
+                    f"지역: {restaurant.area}",
+                    f"상세 지역: {' '.join(part for part in (restaurant.city, restaurant.district, restaurant.town) if part) or '없음'}",
+                    f"주소: {address}",
+                    f"음식 종류: {restaurant.cuisine}",
+                    f"가격대: {restaurant.price_level}",
+                    f"분위기 태그: {', '.join(restaurant.mood_tags) or '없음'}",
+                    f"대표 메뉴: {', '.join(restaurant.signature_menus) or '없음'}",
+                    f"기존 추천 이유: {recommendation.reason}",
+                    f"근거: {evidence}",
+                    f"기본 점수: {recommendation.score}",
+                ]
             )
+            candidates.append(RerankCandidate(candidate_id=restaurant.id, text=text))
+        return candidates
 
-        payload = {
-            "user_query": query,
-            "requested_area": requested_area,
-            "backend_area_filter": area_filter,
-            "current_location": (
-                {"latitude": latitude, "longitude": longitude}
-                if latitude is not None and longitude is not None
-                else None
-            ),
-            "selection_count": limit,
-            "rules": [
-                "candidate_id는 candidates 안의 값만 사용한다.",
-                "지역 조건이 있으면 그 지역과 맞는 후보만 고른다.",
-                "사용자 발화에서 상황, 분위기, 가격감, 식사 강도, 제외 의도를 추론한다.",
-                "혼밥, 간단히, 출출함, 데이트, 회식 같은 표현은 후보 선택 이유에 반영한다.",
-                "혼밥, 출출함, 한 끼, 식사, 밥처럼 실제 식사를 뜻하는 요청이면 카페/디저트/커피 후보보다 밥집, 한식, 일식, 분식, 면, 덮밥, 돈까스, 라멘 같은 식사 후보를 우선한다.",
-                "사용자가 카페를 직접 원하지 않았고 식사 후보가 충분하면 카페 후보는 선택하지 않는다.",
-                "카카오 후보도 저장 후보처럼 말하지 말고 source를 고려한다.",
-                "반드시 JSON만 반환한다.",
-            ],
-            "response_schema": {
-                "intent_summary": "string",
-                "ranked_candidates": [
-                    {
-                        "candidate_id": "string",
-                        "rank": 1,
-                        "reason": "string",
-                    }
-                ],
-            },
-            "candidates": candidates,
-        }
-        return json.dumps(payload, ensure_ascii=False)
+    def _parse_rerank_scores(
+        self,
+        data: Any,
+        candidates: list[RerankCandidate],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        scores = self._extract_rerank_scores(data, len(candidates))
+        if not scores:
+            raise HuggingFaceChatError("Hugging Face rerank response format is invalid")
 
-    def _parse_rerank_response(self, content: str) -> list[dict[str, Any]]:
-        stripped = content.strip()
-        if stripped.startswith("```"):
-            stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
-            stripped = re.sub(r"\s*```$", "", stripped)
+        ranked = sorted(scores, key=lambda item: item[1], reverse=True)[:limit]
+        return [
+            {
+                "candidate_id": candidates[index].candidate_id,
+                "rank": rank,
+                "score": score,
+            }
+            for rank, (index, score) in enumerate(ranked, start=1)
+            if 0 <= index < len(candidates)
+        ]
+
+    def _extract_rerank_scores(self, data: Any, candidate_count: int) -> list[tuple[int, float]]:
+        if isinstance(data, dict):
+            results = data.get("results")
+            if isinstance(results, list):
+                scores = []
+                for fallback_index, item in enumerate(results):
+                    if not isinstance(item, dict):
+                        continue
+                    index = self._as_int(item.get("index"), fallback_index)
+                    score = self._as_float(item.get("relevance_score", item.get("score")))
+                    if score is not None:
+                        scores.append((index, score))
+                return scores
+            if "output" in data:
+                return self._extract_rerank_scores(data["output"], candidate_count)
+
+        if isinstance(data, list):
+            if len(data) == 1 and isinstance(data[0], list):
+                batch_scores = [
+                    self._as_float(item.get("score"))
+                    for item in data[0][:candidate_count]
+                    if isinstance(item, dict)
+                ]
+                if len(batch_scores) == min(candidate_count, len(data[0])):
+                    return [
+                        (index, score)
+                        for index, score in enumerate(batch_scores)
+                        if score is not None
+                    ]
+
+            if all(isinstance(item, dict) and "index" in item for item in data):
+                scores = []
+                for fallback_index, item in enumerate(data):
+                    index = self._as_int(item.get("index"), fallback_index)
+                    score = self._as_float(item.get("relevance_score", item.get("score")))
+                    if score is not None:
+                        scores.append((index, score))
+                return scores
+
+            scores = []
+            for index, item in enumerate(data[:candidate_count]):
+                score = self._extract_text_classification_score(item)
+                if score is not None:
+                    scores.append((index, score))
+            return scores
+
+        return []
+
+    def _extract_text_classification_score(self, item: Any) -> float | None:
+        if isinstance(item, list):
+            label_scores = [
+                entry
+                for entry in item
+                if isinstance(entry, dict) and self._as_float(entry.get("score")) is not None
+            ]
+            if not label_scores:
+                return None
+            positive = [
+                entry
+                for entry in label_scores
+                if str(entry.get("label", "")).upper() in {"LABEL_1", "POSITIVE", "RELEVANT"}
+            ]
+            selected = positive[0] if positive else max(label_scores, key=lambda entry: self._as_float(entry.get("score")) or 0)
+            return self._as_float(selected.get("score"))
+
+        if isinstance(item, dict):
+            return self._as_float(item.get("relevance_score", item.get("score")))
+
+        return None
+
+    def _as_int(self, value: Any, default: int) -> int:
         try:
-            parsed = json.loads(stripped)
-        except json.JSONDecodeError as error:
-            raise HuggingFaceChatError("Hugging Face rerank response is not valid JSON") from error
-        ranked = parsed.get("ranked_candidates") if isinstance(parsed, dict) else None
-        if not isinstance(ranked, list):
-            raise HuggingFaceChatError("Hugging Face rerank response has no ranked_candidates")
-        return [item for item in ranked if isinstance(item, dict)]
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _as_float(self, value: Any) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _parse_answer_response(self, content: str) -> RestaurantChatCompletion | None:
         stripped = content.strip()
