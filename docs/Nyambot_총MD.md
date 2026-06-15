@@ -566,19 +566,11 @@ NyamBot_Backend/
       auth.py
       users.py
       restaurants.py
-    models/
-      chat.py
-      restaurant.py
-      user.py
-    repositories/
-      restaurant_repository.py
     services/
       auth_exchange.py
-      chat_cancel_store.py
-      chat_message_store.py
+      huggingface_chat.py
       kakao_auth.py
       kakao_local.py
-      restaurant_ai.py
       restaurant_store.py
     schemas.py
   infra/
@@ -589,15 +581,6 @@ NyamBot_Backend/
   requirements.txt
   requirements-db.txt
 ```
-
-Backend layer 기준:
-
-- `routers/`: Spring MVC의 Controller에 해당한다. HTTP 요청/응답, 인증 의존성, 상태 코드 처리를 담당한다.
-- `schemas.py`: Request/Response DTO에 해당한다. FastAPI/Pydantic validation과 API 응답 모델을 담당한다.
-- `models/`: 도메인 Entity 개념을 담는다. 현재는 SQLAlchemy ORM Entity가 아니라 DB row와 비즈니스 개념을 설명하는 dataclass 모델이다.
-- `repositories/`: DB 접근 구현체를 둔다. SQLite fallback과 PostgreSQL/pgvector 저장소 구현을 이 레이어에 둔다.
-- `services/`: 비즈니스 흐름과 외부 저장소/API 조합을 담당한다. 라우터는 기본적으로 이 레이어를 호출한다.
-- `core/`: 설정, 인증, 공통 의존성, 공통 에러 처리를 담당한다.
 
 ### 16.2 Frontend
 
