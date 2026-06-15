@@ -789,7 +789,7 @@ git push --force-with-lease origin feat-001
 
 ### 22.4 feat -> dev 병합 규칙
 
-백엔드 문서 기준:
+공통 기준:
 
 - 기능 브랜치는 `dev` 기준으로 rebase한 뒤 `--no-ff` merge로 `dev`에 병합
 - 기능 브랜치의 흐름을 Git 그래프에서 볼 수 있음
@@ -804,20 +804,6 @@ git switch dev
 git merge --no-ff feat-001 -m "feat: 작업 내용을 dev에 병합"
 git push origin dev
 ```
-
-프론트 문서 기준:
-
-- 기능 브랜치는 `dev` 기준으로 rebase
-- 가능하면 fast-forward merge로 선형 히스토리 유지
-
-```powershell
-git switch dev
-git pull --rebase origin dev
-git merge --ff-only feat-001
-git push origin dev
-```
-
-둘 중 하나로 팀 규칙을 통일해야 한다. 현재 백엔드 문서와 프론트 문서의 merge rule은 서로 다르다.
 
 ### 22.5 dev -> main 배포 병합 규칙
 
