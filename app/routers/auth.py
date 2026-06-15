@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from fastapi.responses import RedirectResponse
 
 from app.core.config import settings
 from app.core.dependencies import get_current_user
+from app.core.errors import AppError, ErrorCode
 from app.core.security import create_access_token
 from app.schemas import AuthCallbackResponse, AuthCodeExchangeRequest, AuthTokenResponse, UserResponse
 from app.services.auth_exchange import auth_code_store
@@ -21,7 +22,7 @@ def kakao_login() -> RedirectResponse:
     try:
         login_url = build_login_url()
     except KakaoAuthError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+        raise AppError(ErrorCode.AUTH_PROVIDER_ERROR, 400, message=str(error)) from error
     return RedirectResponse(login_url)
 
 
@@ -53,7 +54,7 @@ def kakao_callback(code: str | None = None, error: str | None = None) -> Redirec
 def exchange_auth_code(payload: AuthCodeExchangeRequest) -> AuthTokenResponse:
     token = auth_code_store.consume(payload.code)
     if not token:
-        raise HTTPException(status_code=400, detail="Invalid or expired auth code")
+        raise AppError(ErrorCode.INVALID_AUTH_CODE, 400)
     return AuthTokenResponse(access_token=token)
 
 

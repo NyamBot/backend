@@ -4,9 +4,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 
 from app.core.dependencies import get_current_user
+from app.core.errors import AppError, ErrorCode
 from app.schemas import (
     RestaurantChatCancelRequest,
     RestaurantChatCancelResponse,
@@ -187,7 +188,7 @@ def search_kakao_places(query: str, size: int = 5) -> KakaoPlaceSearchResponse:
     try:
         places = search_places(query=query, size=min(max(size, 1), 15))
     except KakaoLocalApiError as error:
-        raise HTTPException(status_code=error.status_code, detail=error.message) from error
+        raise AppError(ErrorCode.KAKAO_LOCAL_ERROR, error.status_code, message=error.message) from error
     return KakaoPlaceSearchResponse(query=query, places=places)
 
 
@@ -229,10 +230,10 @@ def add_restaurant_note(
 ) -> RestaurantResponse:
     target = restaurant_store.get_restaurant(restaurant_id)
     if target is None or target.user_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Restaurant not found")
+        raise AppError(ErrorCode.RESTAURANT_NOT_FOUND, 404)
     restaurant = restaurant_store.add_note(restaurant_id, payload)
     if restaurant is None:
-        raise HTTPException(status_code=404, detail="Restaurant not found")
+        raise AppError(ErrorCode.RESTAURANT_NOT_FOUND, 404)
     return restaurant
 
 
@@ -244,10 +245,10 @@ def update_restaurant(
 ) -> RestaurantResponse:
     target = restaurant_store.get_restaurant(restaurant_id)
     if target is None or target.user_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Restaurant not found")
+        raise AppError(ErrorCode.RESTAURANT_NOT_FOUND, 404)
     restaurant = restaurant_store.update_restaurant(restaurant_id, payload)
     if restaurant is None:
-        raise HTTPException(status_code=404, detail="Restaurant not found")
+        raise AppError(ErrorCode.RESTAURANT_NOT_FOUND, 404)
     return restaurant
 
 
@@ -258,7 +259,7 @@ def delete_restaurant(
 ) -> None:
     target = restaurant_store.get_restaurant(restaurant_id)
     if target is None or target.user_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Restaurant not found")
+        raise AppError(ErrorCode.RESTAURANT_NOT_FOUND, 404)
     restaurant_store.delete_restaurant(restaurant_id)
 
 
@@ -532,7 +533,7 @@ def cancel_chat(
     current_user: UserResponse = Depends(get_current_user),
 ) -> RestaurantChatCancelResponse:
     if not payload.session_id and not payload.request_id:
-        raise HTTPException(status_code=400, detail="session_id or request_id is required")
+        raise AppError(ErrorCode.MISSING_CANCEL_TARGET, 400)
     cancelled = chat_cancel_store.cancel(
         user_id=current_user.id,
         session_id=payload.session_id,
@@ -595,10 +596,10 @@ def delete_chat_session(
     current_user: UserResponse = Depends(get_current_user),
 ) -> None:
     if session_id == "legacy":
-        raise HTTPException(status_code=400, detail="Legacy chat history cannot be deleted from here")
+        raise AppError(ErrorCode.LEGACY_CHAT_SESSION_DELETE_FORBIDDEN, 400)
     deleted = restaurant_store.soft_delete_chat_session(current_user.id, session_id)
     if not deleted:
-        raise HTTPException(status_code=404, detail="Chat session not found")
+        raise AppError(ErrorCode.CHAT_SESSION_NOT_FOUND, 404)
 
 
 @router.get("/{restaurant_id}", response_model=RestaurantResponse)
@@ -608,7 +609,7 @@ def get_restaurant(
 ) -> RestaurantResponse:
     restaurant = restaurant_store.get_restaurant(restaurant_id)
     if restaurant is None or restaurant.user_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Restaurant not found")
+        raise AppError(ErrorCode.RESTAURANT_NOT_FOUND, 404)
     return restaurant
 
 
