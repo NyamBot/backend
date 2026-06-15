@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     hf_token: str | None = None
     huggingface_api_token: str | None = None
     huggingface_chat_base_url: str = "https://router.huggingface.co/v1"
-    huggingface_chat_model: str = "google/gemma-4-26B-A4B-it:featherless-ai"
+    gemma_chat_model: str = "google/gemma-4-26B-A4B-it:featherless-ai"
     huggingface_chat_timeout_seconds: float = 20.0
     huggingface_rerank_enabled: bool = True
     huggingface_rerank_base_url: str = "https://router.huggingface.co/hf-inference/models"

@@ -11,7 +11,7 @@ from app.core.config import settings
 from app.schemas import RestaurantRecommendation
 
 
-class HuggingFaceChatError(RuntimeError):
+class RestaurantAiError(RuntimeError):
     pass
 
 
@@ -27,10 +27,10 @@ class RerankCandidate:
     text: str
 
 
-class HuggingFaceChatService:
+class RestaurantAiService:
     def __init__(self) -> None:
         self.base_url = settings.huggingface_chat_base_url.rstrip("/")
-        self.model = settings.huggingface_chat_model
+        self.model = settings.gemma_chat_model
         self.timeout_seconds = settings.huggingface_chat_timeout_seconds
         self.rerank_enabled = settings.huggingface_rerank_enabled
         self.rerank_base_url = settings.huggingface_rerank_base_url.rstrip("/")
@@ -66,8 +66,9 @@ class HuggingFaceChatService:
                         "너의 역할은 새 식당을 찾는 것이 아니라, 백엔드가 이미 고른 후보를 사용자 요청에 맞게 설명하는 것이야. "
                         "후보 목록에 없는 식당, 메뉴, 영업시간, 휴무일, 웨이팅 정보를 지어내지 마. "
                         "후보 순서를 바꾸지 말고 1번을 1순위, 2번을 2순위, 3번을 3순위로 유지해. "
-                        "저장 기록 후보와 카카오 장소 검색 후보를 구분해서 말해. "
-                        "카카오 장소 검색 후보는 저장된 기록이 있다고 표현하지 마. "
+                        "저장 기록 후보는 저장 메모와 취향 근거를 중심으로 설명해. "
+                        "장소 검색 후보는 저장된 기록이 있다고 표현하지 말고, 지역, 업종, 거리, 접근성처럼 확인 가능한 특징만 자연스럽게 설명해. "
+                        "답변에서 카카오, 장소 검색, 백엔드, 후보 출처 같은 내부 출처 표현은 반복하지 마. "
                         "한국어로 짧고 친근하게 답해. "
                         "Markdown 문법을 쓰지 마. 별표, 굵은 글씨, 이모지는 사용하지 마."
                     ),
@@ -104,15 +105,15 @@ class HuggingFaceChatService:
             response.raise_for_status()
         except httpx.HTTPStatusError as error:
             detail = error.response.text[:500] if error.response is not None else str(error)
-            raise HuggingFaceChatError(detail) from error
+            raise RestaurantAiError(detail) from error
         except httpx.HTTPError as error:
-            raise HuggingFaceChatError(str(error)) from error
+            raise RestaurantAiError(str(error)) from error
 
         data = response.json()
         try:
             answer = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as error:
-            raise HuggingFaceChatError("Hugging Face chat response format is invalid") from error
+            raise RestaurantAiError("Hugging Face chat response format is invalid") from error
         return self._parse_answer_response(str(answer))
 
     def rerank_restaurant_candidates(
@@ -150,9 +151,9 @@ class HuggingFaceChatService:
             response.raise_for_status()
         except httpx.HTTPStatusError as error:
             detail = error.response.text[:500] if error.response is not None else str(error)
-            raise HuggingFaceChatError(detail) from error
+            raise RestaurantAiError(detail) from error
         except httpx.HTTPError as error:
-            raise HuggingFaceChatError(str(error)) from error
+            raise RestaurantAiError(str(error)) from error
 
         return self._parse_rerank_scores(response.json(), candidates, limit)
 
@@ -171,7 +172,7 @@ class HuggingFaceChatService:
             )
 
         mode = (
-            "저장 맛집 후보가 부족해서 카카오 장소 검색 후보가 포함되어 있습니다."
+            "저장 맛집 후보가 부족해서 외부 장소 후보가 포함되어 있습니다. 이 정보는 내부 판단용이며 답변에 그대로 쓰지 마세요."
             if fallback
             else "사용자의 저장 맛집 후보만 사용 중입니다."
         )
@@ -186,7 +187,9 @@ class HuggingFaceChatService:
             "- 후보 순서를 그대로 유지해. 점수를 다시 매기거나 순위를 바꾸지 마.",
             "- 요청 지역이 있으면 지역 조건을 가장 중요한 기준으로 설명해.",
             "- 사용자가 혼밥, 데이트, 회식처럼 상황을 말하면 그 상황과 맞는 이유를 근거 안에서만 설명해.",
-            "- 근거가 카카오 장소 검색이면 저장 메모라고 말하지 마.",
+            "- 후보 출처는 내부 판단용이야. 답변에는 카카오, 장소 검색, 백엔드 같은 출처 표현을 쓰지 마.",
+            "- 저장 맛집 기록 후보는 저장 메모를 근거로 설명해.",
+            "- 외부 장소 후보는 저장 메모라고 말하지 말고, 지역/종류/거리/접근성/요청 상황 적합성으로 설명해.",
             "- 영업시간, 휴무, 웨이팅은 확인이 필요하다고만 말하고 구체 값을 지어내지 마.",
             "",
             "후보 목록:",
@@ -203,8 +206,8 @@ class HuggingFaceChatService:
                     f"- 지역/종류/가격: {meta}",
                     f"- 분위기 태그: {', '.join(restaurant.mood_tags) or '없음'}",
                     f"- 추천 점수: {recommendation.score}",
-                    f"- 기존 추천 이유: {recommendation.reason}",
-                    f"- 근거 기록: {evidence}",
+                    f"- 판단 힌트: {recommendation.reason}",
+                    f"- 저장 메모 또는 장소 특징: {evidence}",
                     f"- 카카오 링크: {restaurant.kakao_place_url or '없음'}",
                 ]
             )
@@ -215,7 +218,7 @@ class HuggingFaceChatService:
                 "- 첫 문장에 가장 잘 맞는 후보를 말해줘.",
                 "- 최대 3개까지 번호 목록으로 추천해줘.",
                 "- 각 후보마다 왜 맞는지와 근거를 한두 문장으로 짧게 적어줘.",
-                "- 카카오 후보라면 '저장된 기록' 대신 '장소 검색 기준 후보'라고 말해줘.",
+                "- 저장 메모가 없는 후보는 출처를 말하지 말고, 확인 가능한 장소 특징만 근거처럼 풀어줘.",
                 "- 마지막에 영업시간/휴무는 방문 전에 확인하라고 한 번만 안내해줘.",
                 "- 별표나 굵은 글씨 같은 Markdown 문법은 절대 쓰지 마.",
                 "- 이모지는 쓰지 마.",
@@ -266,7 +269,7 @@ class HuggingFaceChatService:
                     f"가격대: {restaurant.price_level}",
                     f"분위기 태그: {', '.join(restaurant.mood_tags) or '없음'}",
                     f"대표 메뉴: {', '.join(restaurant.signature_menus) or '없음'}",
-                    f"기존 추천 이유: {recommendation.reason}",
+                    f"판단 힌트: {recommendation.reason}",
                     f"근거: {evidence}",
                     f"기본 점수: {recommendation.score}",
                 ]
@@ -282,7 +285,7 @@ class HuggingFaceChatService:
     ) -> list[dict[str, Any]]:
         scores = self._extract_rerank_scores(data, len(candidates))
         if not scores:
-            raise HuggingFaceChatError("Hugging Face rerank response format is invalid")
+            raise RestaurantAiError("Hugging Face rerank response format is invalid")
 
         ranked = sorted(scores, key=lambda item: item[1], reverse=True)[:limit]
         return [
@@ -414,4 +417,4 @@ class HuggingFaceChatService:
         return cleaned[:24]
 
 
-huggingface_chat_service = HuggingFaceChatService()
+restaurant_ai_service = RestaurantAiService()
