@@ -2,11 +2,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
+from app.core.errors import AppError, app_error_handler
 from app.routers import auth, restaurants, users
 from app.schemas import HealthResponse
 from app.services.restaurant_store import restaurant_store
 
 app = FastAPI(title=settings.app_name)
+app.add_exception_handler(AppError, app_error_handler)
 
 app.add_middleware(
     CORSMiddleware,

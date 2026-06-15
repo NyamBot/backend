@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 
 from app.core.dependencies import get_current_user
+from app.core.errors import AppError, ErrorCode
 from app.schemas import UserCreate, UserLevelEventRequest, UserLevelEventResponse, UserLevelResponse, UserResponse
 from app.services.restaurant_store import restaurant_store
 
@@ -28,7 +29,7 @@ def create_user(payload: UserCreate) -> UserResponse:
 def get_user(user_id: str) -> UserResponse:
     user = restaurant_store.get_user(user_id)
     if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise AppError(ErrorCode.USER_NOT_FOUND, 404)
     return UserResponse(**user)
 
 
@@ -36,7 +37,7 @@ def get_user(user_id: str) -> UserResponse:
 def get_my_level(current_user: UserResponse = Depends(get_current_user)) -> UserLevelResponse:
     level = restaurant_store.get_user_level(current_user.id)
     if level is None:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise AppError(ErrorCode.USER_NOT_FOUND, 404)
     return UserLevelResponse(**level)
 
 
@@ -48,9 +49,9 @@ def add_my_level_event(
     try:
         result = restaurant_store.add_user_level_event(current_user.id, payload.event_type)
     except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+        raise AppError(ErrorCode.UNSUPPORTED_LEVEL_EVENT, 400, message=str(error)) from error
     if result is None:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise AppError(ErrorCode.USER_NOT_FOUND, 404)
     points_added, level = result
     return UserLevelEventResponse(
         event_type=payload.event_type,
@@ -63,4 +64,4 @@ def add_my_level_event(
 def delete_me(current_user: UserResponse = Depends(get_current_user)) -> None:
     deleted = restaurant_store.delete_user(current_user.id)
     if not deleted:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise AppError(ErrorCode.USER_NOT_FOUND, 404)
