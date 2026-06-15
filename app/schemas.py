@@ -2,11 +2,15 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+TextFilter = str | list[str] | None
+
 
 class HealthResponse(BaseModel):
     status: str
     app: str
     vector_store: str
+    chat_message_store: str
+    chat_message_error: str | None = None
     database_url: str
 
 
@@ -172,8 +176,8 @@ class RestaurantRecommendationRequest(BaseModel):
     user_id: str | None = None
     query: str = Field(min_length=1)
     area: str | None = None
-    cuisine: str | None = None
-    price_level: str | None = None
+    cuisine: TextFilter = None
+    price_level: TextFilter = None
     tags: list[str] = []
     latitude: float | None = None
     longitude: float | None = None
@@ -194,13 +198,33 @@ class RestaurantRecommendationsResponse(BaseModel):
     recommendations: list[RestaurantRecommendation]
 
 
-class RestaurantChatRequest(RestaurantRecommendationRequest):
+class RestaurantChatRequest(BaseModel):
+    query: str = Field(min_length=1)
     message: str = Field(min_length=1)
+    area: str | None = None
+    tags: list[str] = []
+    latitude: float | None = None
+    longitude: float | None = None
+    limit: int = Field(default=3, ge=1, le=5)
     session_id: str | None = None
+    request_id: str | None = None
+
+
+class RestaurantChatCancelRequest(BaseModel):
+    session_id: str | None = None
+    request_id: str | None = None
+
+
+class RestaurantChatCancelResponse(BaseModel):
+    cancelled: bool
+    session_id: str | None = None
+    request_id: str | None = None
 
 
 class RestaurantChatResponse(BaseModel):
     session_id: str
+    request_id: str
+    cancelled: bool = False
     answer: str
     recommendations: list[RestaurantRecommendation]
     context: list[str]
@@ -229,8 +253,14 @@ class TasteAgentSession(BaseModel):
 class TasteAgentMessagesResponse(BaseModel):
     user_id: str | None
     messages: list[TasteAgentMessage]
+    limit: int
+    offset: int
+    has_more: bool
 
 
 class TasteAgentSessionsResponse(BaseModel):
     user_id: str | None
     sessions: list[TasteAgentSession]
+    limit: int
+    offset: int
+    has_more: bool

@@ -18,6 +18,7 @@ from app.schemas import (
     TasteAgentMessage,
     TasteAgentSession,
 )
+from app.services.chat_message_store import chat_message_store
 
 VECTOR_DIMENSIONS = 96
 USER_LEVELS = (
@@ -35,6 +36,77 @@ USER_LEVEL_EVENT_POINTS = {
     "saved_by_other": 5,
     "weekly_share": 5,
 }
+
+TextFilter = str | list[str] | tuple[str, ...] | None
+
+
+def _normalize_text_filter(value: TextFilter) -> list[str]:
+    if value is None:
+        return []
+    raw_values: list[str]
+    if isinstance(value, str):
+        raw_values = [value]
+    else:
+        raw_values = [str(item) for item in value]
+
+    normalized: list[str] = []
+    for raw_value in raw_values:
+        normalized.extend(part.strip() for part in raw_value.split(",") if part.strip())
+    return normalized
+
+
+def _filter_text(value: TextFilter) -> str:
+    return " ".join(_normalize_text_filter(value))
+
+
+def _first_filter_value(value: TextFilter) -> str | None:
+    values = _normalize_text_filter(value)
+    return values[0] if values else None
+
+
+def _append_region_filter_clause(
+    clauses: list[str],
+    params: list[Any],
+    value: TextFilter,
+    operator: str,
+    placeholder: str,
+) -> None:
+    values = _normalize_text_filter(value)
+    if not values:
+        return
+
+    columns = (
+        "restaurants.city",
+        "restaurants.district",
+        "restaurants.town",
+        "restaurants.road_address",
+        "restaurants.address",
+        "restaurants.area",
+    )
+    value_clauses = []
+    for filter_value in values:
+        value_clauses.append(
+            "(" + " OR ".join(f"{column} {operator} {placeholder}" for column in columns) + ")"
+        )
+        params.extend([f"%{filter_value}%"] * len(columns))
+    clauses.append("(" + " OR ".join(value_clauses) + ")")
+
+
+def _append_column_filter_clause(
+    clauses: list[str],
+    params: list[Any],
+    column: str,
+    value: TextFilter,
+    operator: str,
+    placeholder: str,
+    *,
+    exact: bool = False,
+) -> None:
+    values = _normalize_text_filter(value)
+    if not values:
+        return
+    clauses.append("(" + " OR ".join(f"{column} {operator} {placeholder}" for _ in values) + ")")
+    params.extend(values if exact else [f"%{item}%" for item in values])
 
 
 def _embed(text: str) -> list[float]:
@@ -171,7 +243,8 @@ class SqliteRestaurantStore:
                     user_id TEXT,
                     title TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    deleted_at TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_taste_agent_sessions_user_id
@@ -219,6 +292,7 @@ class SqliteRestaurantStore:
                 "ALTER TABLE restaurants ADD COLUMN town TEXT",
                 "ALTER TABLE taste_agent_messages ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
                 "ALTER TABLE taste_agent_messages ADD COLUMN session_id TEXT REFERENCES taste_agent_sessions(id) ON DELETE CASCADE",
+                "ALTER TABLE taste_agent_sessions ADD COLUMN deleted_at TEXT",
                 "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'",
                 "ALTER TABLE users ADD COLUMN level_key TEXT NOT NULL DEFAULT 'egg'",
                 "ALTER TABLE users ADD COLUMN level_points INTEGER NOT NULL DEFAULT 0",
@@ -448,9 +522,11 @@ class SqliteRestaurantStore:
     def list_restaurants(
         self,
         user_id: str | None = None,
-        city: str | None = None,
-        district: str | None = None,
-        town: str | None = None,
+        city: TextFilter = None,
+        district: TextFilter = None,
+        town: TextFilter = None,
+        cuisine: TextFilter = None,
+        price_level: TextFilter = None,
         query: str | None = None,
         limit: int = 50,
         offset: int = 0,
@@ -461,18 +537,17 @@ class SqliteRestaurantStore:
             clauses.append("restaurants.user_id = ?")
             params.append(user_id)
         for value in (city, district, town):
-            if value:
-                clauses.append(
-                    """(
-                        restaurants.city LIKE ?
-                        OR restaurants.district LIKE ?
-                        OR restaurants.town LIKE ?
-                        OR restaurants.road_address LIKE ?
-                        OR restaurants.address LIKE ?
-                        OR restaurants.area LIKE ?
-                    )"""
-                )
-                params.extend([f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%"])
+            _append_region_filter_clause(clauses, params, value, "LIKE", "?")
+        _append_column_filter_clause(clauses, params, "restaurants.cuisine", cuisine, "LIKE", "?")
+        _append_column_filter_clause(
+            clauses,
+            params,
+            "restaurants.price_level",
+            price_level,
+            "=",
+            "?",
+            exact=True,
+        )
         if query:
             like = f"%{query}%"
             clauses.append(
@@ -578,17 +653,23 @@ class SqliteRestaurantStore:
         query: str,
         user_id: str | None,
         area: str | None,
-        cuisine: str | None,
-        price_level: str | None,
+        cuisine: TextFilter,
+        price_level: TextFilter,
         tags: list[str],
         latitude: float | None,
         longitude: float | None,
         limit: int,
     ) -> list[RestaurantRecommendation]:
-        query_embedding = _embed(" ".join([query, area or "", cuisine or "", price_level or "", " ".join(tags)]))
+        cuisine_text = _filter_text(cuisine)
+        price_level_text = _filter_text(price_level)
+        query_embedding = _embed(" ".join([query, area or "", cuisine_text, price_level_text, " ".join(tags)]))
         rows = self._search_note_rows(user_id, area, cuisine, price_level)
         scored: dict[str, dict[str, Any]] = {}
-        normalized_terms = {term.lower() for term in tags + [query, area or "", cuisine or "", price_level or ""] if term}
+        normalized_terms = {
+            term.lower()
+            for term in tags + [query, area or ""] + _normalize_text_filter(cuisine) + _normalize_text_filter(price_level)
+            if term
+        }
         for row in rows:
             note_tags = {tag.lower() for tag in _json_list(row["tags_json"])}
             restaurant_tags = {tag.lower() for tag in _json_list(row["mood_tags_json"])}
@@ -619,8 +700,8 @@ class SqliteRestaurantStore:
         self,
         user_id: str | None,
         area: str | None,
-        cuisine: str | None,
-        price_level: str | None,
+        cuisine: TextFilter,
+        price_level: TextFilter,
     ) -> list[sqlite3.Row]:
         clauses = []
         params: list[str] = []
@@ -630,12 +711,16 @@ class SqliteRestaurantStore:
         if area:
             clauses.append("restaurants.area LIKE ?")
             params.append(f"%{area}%")
-        if cuisine:
-            clauses.append("restaurants.cuisine LIKE ?")
-            params.append(f"%{cuisine}%")
-        if price_level:
-            clauses.append("restaurants.price_level = ?")
-            params.append(price_level)
+        _append_column_filter_clause(clauses, params, "restaurants.cuisine", cuisine, "LIKE", "?")
+        _append_column_filter_clause(
+            clauses,
+            params,
+            "restaurants.price_level",
+            price_level,
+            "=",
+            "?",
+            exact=True,
+        )
         where_clause = "WHERE " + " AND ".join(clauses) if clauses else ""
         with self._connect() as connection:
             return connection.execute(
@@ -709,7 +794,7 @@ class SqliteRestaurantStore:
         if session_id:
             with self._connect() as connection:
                 row = connection.execute(
-                    "SELECT id FROM taste_agent_sessions WHERE id = ? AND user_id = ?",
+                    "SELECT id FROM taste_agent_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
                     (session_id, user_id),
                 ).fetchone()
             if row:
@@ -725,9 +810,37 @@ class SqliteRestaurantStore:
                 (session_id,),
             )
 
-    def list_messages(self, user_id: str | None) -> list[TasteAgentMessage]:
-        where_clause = "WHERE user_id = ?" if user_id else ""
-        params = (user_id,) if user_id else ()
+    def update_chat_session_title(self, user_id: str | None, session_id: str, title: str) -> None:
+        session_title = title[:80].strip()
+        if not session_title:
+            return
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE taste_agent_sessions
+                SET title = ?
+                WHERE id = ? AND user_id = ? AND deleted_at IS NULL
+                """,
+                (session_title, session_id, user_id),
+            )
+
+    def list_messages(
+        self,
+        user_id: str | None,
+        session_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[TasteAgentMessage], bool]:
+        clauses = []
+        params: list[Any] = []
+        if user_id:
+            clauses.append("user_id = ?")
+            params.append(user_id)
+        if session_id:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        where_clause = "WHERE " + " AND ".join(clauses) if clauses else ""
+        params.extend([limit + 1, offset])
         with self._connect() as connection:
             rows = connection.execute(
                 f"""
@@ -735,30 +848,56 @@ class SqliteRestaurantStore:
                 FROM taste_agent_messages
                 {where_clause}
                 ORDER BY created_at ASC
+                LIMIT ? OFFSET ?
                 """,
-                params,
+                tuple(params),
             ).fetchall()
-        return [self._message_from_row(row) for row in rows]
+        return [self._message_from_row(row) for row in rows[:limit]], len(rows) > limit
 
-    def list_sessions(self, user_id: str | None) -> list[TasteAgentSession]:
-        messages = self.list_messages(user_id)
+    def list_sessions(
+        self,
+        user_id: str | None,
+        limit: int = 20,
+        offset: int = 0,
+        session_id: str | None = None,
+    ) -> tuple[list[TasteAgentSession], bool]:
+        clauses = ["user_id = ?"]
+        params: list[Any] = [user_id]
+        if session_id:
+            clauses.append("id = ?")
+            params.append(session_id)
+        params.extend([limit + 1, offset])
         with self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT id, user_id, title, created_at, updated_at
                 FROM taste_agent_sessions
-                WHERE user_id = ?
+                WHERE {" AND ".join(clauses)} AND deleted_at IS NULL
                 ORDER BY updated_at DESC
+                LIMIT ? OFFSET ?
                 """,
-                (user_id,),
+                tuple(params),
             ).fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        session_messages: dict[str, list[TasteAgentMessage]] = {}
+        for row in rows:
+            messages, _ = self.list_messages(user_id, session_id=row["id"], limit=1000)
+            session_messages[str(row["id"])] = messages
 
         grouped: dict[str, list[TasteAgentMessage]] = {}
         legacy_messages: list[TasteAgentMessage] = []
-        for message in messages:
-            if message.session_id:
-                grouped.setdefault(message.session_id, []).append(message)
-            else:
+        for messages in session_messages.values():
+            for message in messages:
+                if message.session_id:
+                    grouped.setdefault(message.session_id, []).append(message)
+                else:
+                    legacy_messages.append(message)
+        if not session_id and offset == 0:
+            messages, _ = self.list_messages(user_id, session_id=None, limit=1000)
+            for message in messages:
+                if message.session_id:
+                    continue
                 legacy_messages.append(message)
 
         sessions = [
@@ -783,7 +922,19 @@ class SqliteRestaurantStore:
                     messages=legacy_messages,
                 )
             )
-        return sessions
+        return sessions, has_more
+
+    def soft_delete_chat_session(self, user_id: str | None, session_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE taste_agent_sessions
+                SET deleted_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ? AND deleted_at IS NULL
+                """,
+                (session_id, user_id),
+            )
+            return cursor.rowcount > 0
 
     def _restaurant_from_row(self, row: Any) -> RestaurantResponse:
         return RestaurantResponse(
@@ -908,10 +1059,12 @@ class PgRestaurantStore(SqliteRestaurantStore):
                         user_id TEXT,
                         title TEXT NOT NULL,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        deleted_at TIMESTAMPTZ
                     )
                     """
                 )
+                cursor.execute("ALTER TABLE taste_agent_sessions ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_taste_agent_sessions_user_id ON taste_agent_sessions(user_id)")
                 cursor.execute(
                     """
@@ -1199,9 +1352,11 @@ class PgRestaurantStore(SqliteRestaurantStore):
     def list_restaurants(
         self,
         user_id: str | None = None,
-        city: str | None = None,
-        district: str | None = None,
-        town: str | None = None,
+        city: TextFilter = None,
+        district: TextFilter = None,
+        town: TextFilter = None,
+        cuisine: TextFilter = None,
+        price_level: TextFilter = None,
         query: str | None = None,
         limit: int = 50,
         offset: int = 0,
@@ -1212,18 +1367,17 @@ class PgRestaurantStore(SqliteRestaurantStore):
             clauses.append("restaurants.user_id = %s")
             params.append(user_id)
         for value in (city, district, town):
-            if value:
-                clauses.append(
-                    """(
-                        restaurants.city ILIKE %s
-                        OR restaurants.district ILIKE %s
-                        OR restaurants.town ILIKE %s
-                        OR restaurants.road_address ILIKE %s
-                        OR restaurants.address ILIKE %s
-                        OR restaurants.area ILIKE %s
-                    )"""
-                )
-                params.extend([f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%", f"%{value}%"])
+            _append_region_filter_clause(clauses, params, value, "ILIKE", "%s")
+        _append_column_filter_clause(clauses, params, "restaurants.cuisine", cuisine, "ILIKE", "%s")
+        _append_column_filter_clause(
+            clauses,
+            params,
+            "restaurants.price_level",
+            price_level,
+            "=",
+            "%s",
+            exact=True,
+        )
         if query:
             like = f"%{query}%"
             clauses.append(
@@ -1339,18 +1493,24 @@ class PgRestaurantStore(SqliteRestaurantStore):
         query: str,
         user_id: str | None,
         area: str | None,
-        cuisine: str | None,
-        price_level: str | None,
+        cuisine: TextFilter,
+        price_level: TextFilter,
         tags: list[str],
         latitude: float | None,
         longitude: float | None,
         limit: int,
     ) -> list[RestaurantRecommendation]:
-        query_text = " ".join([query, area or "", cuisine or "", price_level or "", " ".join(tags)])
+        cuisine_text = _filter_text(cuisine)
+        price_level_text = _filter_text(price_level)
+        query_text = " ".join([query, area or "", cuisine_text, price_level_text, " ".join(tags)])
         query_embedding = _embedding_to_pgvector(_embed(query_text))
         rows = self._search_vector_note_rows(query_embedding, user_id, area, cuisine, price_level, limit * 8)
         scored: dict[str, dict[str, Any]] = {}
-        normalized_terms = {term.lower() for term in tags + [query, area or "", cuisine or "", price_level or ""] if term}
+        normalized_terms = {
+            term.lower()
+            for term in tags + [query, area or ""] + _normalize_text_filter(cuisine) + _normalize_text_filter(price_level)
+            if term
+        }
         for row in rows:
             note_tags = {tag.lower() for tag in _json_list(row["tags_json"])}
             restaurant_tags = {tag.lower() for tag in _json_list(row["mood_tags_json"])}
@@ -1382,8 +1542,8 @@ class PgRestaurantStore(SqliteRestaurantStore):
         query_embedding: str,
         user_id: str | None,
         area: str | None,
-        cuisine: str | None,
-        price_level: str | None,
+        cuisine: TextFilter,
+        price_level: TextFilter,
         limit: int,
     ) -> list[dict[str, Any]]:
         clauses = []
@@ -1394,12 +1554,16 @@ class PgRestaurantStore(SqliteRestaurantStore):
         if area:
             clauses.append("restaurants.area ILIKE %s")
             params.append(f"%{area}%")
-        if cuisine:
-            clauses.append("restaurants.cuisine ILIKE %s")
-            params.append(f"%{cuisine}%")
-        if price_level:
-            clauses.append("restaurants.price_level = %s")
-            params.append(price_level)
+        _append_column_filter_clause(clauses, params, "restaurants.cuisine", cuisine, "ILIKE", "%s")
+        _append_column_filter_clause(
+            clauses,
+            params,
+            "restaurants.price_level",
+            price_level,
+            "=",
+            "%s",
+            exact=True,
+        )
         where_clause = "WHERE " + " AND ".join(clauses) if clauses else ""
         params.append(max(limit, 1))
         with self._connect() as connection:
@@ -1426,8 +1590,8 @@ class PgRestaurantStore(SqliteRestaurantStore):
         self,
         user_id: str | None,
         area: str | None,
-        cuisine: str | None,
-        price_level: str | None,
+        cuisine: TextFilter,
+        price_level: TextFilter,
     ) -> list[dict[str, Any]]:
         clauses = []
         params: list[str] = []
@@ -1437,12 +1601,16 @@ class PgRestaurantStore(SqliteRestaurantStore):
         if area:
             clauses.append("restaurants.area ILIKE %s")
             params.append(f"%{area}%")
-        if cuisine:
-            clauses.append("restaurants.cuisine ILIKE %s")
-            params.append(f"%{cuisine}%")
-        if price_level:
-            clauses.append("restaurants.price_level = %s")
-            params.append(price_level)
+        _append_column_filter_clause(clauses, params, "restaurants.cuisine", cuisine, "ILIKE", "%s")
+        _append_column_filter_clause(
+            clauses,
+            params,
+            "restaurants.price_level",
+            price_level,
+            "=",
+            "%s",
+            exact=True,
+        )
         where_clause = "WHERE " + " AND ".join(clauses) if clauses else ""
         with self._connect() as connection:
             with connection.cursor(row_factory=self.dict_row) as cursor:
@@ -1529,7 +1697,7 @@ class PgRestaurantStore(SqliteRestaurantStore):
             with self._connect() as connection:
                 with connection.cursor(row_factory=self.dict_row) as cursor:
                     cursor.execute(
-                        "SELECT id FROM taste_agent_sessions WHERE id = %s AND user_id = %s",
+                        "SELECT id FROM taste_agent_sessions WHERE id = %s AND user_id = %s AND deleted_at IS NULL",
                         (session_id, user_id),
                     )
                     row = cursor.fetchone()
@@ -1546,9 +1714,39 @@ class PgRestaurantStore(SqliteRestaurantStore):
                 )
             connection.commit()
 
-    def list_messages(self, user_id: str | None) -> list[TasteAgentMessage]:
-        where_clause = "WHERE user_id = %s" if user_id else ""
-        params = (user_id,) if user_id else ()
+    def update_chat_session_title(self, user_id: str | None, session_id: str, title: str) -> None:
+        session_title = title[:80].strip()
+        if not session_title:
+            return
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE taste_agent_sessions
+                    SET title = %s
+                    WHERE id = %s AND user_id = %s AND deleted_at IS NULL
+                    """,
+                    (session_title, session_id, user_id),
+                )
+            connection.commit()
+
+    def list_messages(
+        self,
+        user_id: str | None,
+        session_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[TasteAgentMessage], bool]:
+        clauses = []
+        params: list[Any] = []
+        if user_id:
+            clauses.append("user_id = %s")
+            params.append(user_id)
+        if session_id:
+            clauses.append("session_id = %s")
+            params.append(session_id)
+        where_clause = "WHERE " + " AND ".join(clauses) if clauses else ""
+        params.extend([limit + 1, offset])
         with self._connect() as connection:
             with connection.cursor(row_factory=self.dict_row) as cursor:
                 cursor.execute(
@@ -1558,33 +1756,59 @@ class PgRestaurantStore(SqliteRestaurantStore):
                     FROM taste_agent_messages
                     {where_clause}
                     ORDER BY created_at ASC
+                    LIMIT %s OFFSET %s
                     """,
-                    params,
+                    tuple(params),
                 )
                 rows = cursor.fetchall()
-        return [self._message_from_row(row) for row in rows]
+        return [self._message_from_row(row) for row in rows[:limit]], len(rows) > limit
 
-    def list_sessions(self, user_id: str | None) -> list[TasteAgentSession]:
-        messages = self.list_messages(user_id)
+    def list_sessions(
+        self,
+        user_id: str | None,
+        limit: int = 20,
+        offset: int = 0,
+        session_id: str | None = None,
+    ) -> tuple[list[TasteAgentSession], bool]:
+        clauses = ["user_id = %s"]
+        params: list[Any] = [user_id]
+        if session_id:
+            clauses.append("id = %s")
+            params.append(session_id)
+        params.extend([limit + 1, offset])
         with self._connect() as connection:
             with connection.cursor(row_factory=self.dict_row) as cursor:
                 cursor.execute(
-                    """
+                    f"""
                     SELECT id, user_id, title, created_at::text AS created_at, updated_at::text AS updated_at
                     FROM taste_agent_sessions
-                    WHERE user_id = %s
+                    WHERE {" AND ".join(clauses)} AND deleted_at IS NULL
                     ORDER BY updated_at DESC
+                    LIMIT %s OFFSET %s
                     """,
-                    (user_id,),
+                    tuple(params),
                 )
                 rows = cursor.fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        session_messages: dict[str, list[TasteAgentMessage]] = {}
+        for row in rows:
+            messages, _ = self.list_messages(user_id, session_id=row["id"], limit=1000)
+            session_messages[str(row["id"])] = messages
 
         grouped: dict[str, list[TasteAgentMessage]] = {}
         legacy_messages: list[TasteAgentMessage] = []
-        for message in messages:
-            if message.session_id:
-                grouped.setdefault(message.session_id, []).append(message)
-            else:
+        for messages in session_messages.values():
+            for message in messages:
+                if message.session_id:
+                    grouped.setdefault(message.session_id, []).append(message)
+                else:
+                    legacy_messages.append(message)
+        if not session_id and offset == 0:
+            messages, _ = self.list_messages(user_id, session_id=None, limit=1000)
+            for message in messages:
+                if message.session_id:
+                    continue
                 legacy_messages.append(message)
 
         sessions = [
@@ -1609,12 +1833,28 @@ class PgRestaurantStore(SqliteRestaurantStore):
                     messages=legacy_messages,
                 )
             )
-        return sessions
+        return sessions, has_more
+
+    def soft_delete_chat_session(self, user_id: str | None, session_id: str) -> bool:
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE taste_agent_sessions
+                    SET deleted_at = NOW()
+                    WHERE id = %s AND user_id = %s AND deleted_at IS NULL
+                    """,
+                    (session_id, user_id),
+                )
+                deleted = cursor.rowcount > 0
+            connection.commit()
+        return deleted
 
 
 class RestaurantStore:
     def __init__(self) -> None:
         self.initialization_error: str | None = None
+        self.chat_message_error: str | None = None
         try:
             if settings.database_url.startswith(("postgresql://", "postgres://")):
                 self.backend = PgRestaurantStore(settings.database_url)
@@ -1671,19 +1911,27 @@ class RestaurantStore:
         return self.backend.add_user_level_event(user_id, event_type)
 
     def delete_user(self, user_id: str) -> bool:
-        return self.backend.delete_user(user_id)
+        deleted = self.backend.delete_user(user_id)
+        if deleted and chat_message_store.enabled:
+            try:
+                chat_message_store.delete_user_messages(user_id)
+            except Exception as error:
+                self.chat_message_error = str(error)
+        return deleted
 
     def list_restaurants(
         self,
         user_id: str | None = None,
-        city: str | None = None,
-        district: str | None = None,
-        town: str | None = None,
+        city: TextFilter = None,
+        district: TextFilter = None,
+        town: TextFilter = None,
+        cuisine: TextFilter = None,
+        price_level: TextFilter = None,
         query: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[RestaurantResponse]:
-        return self.backend.list_restaurants(user_id, city, district, town, query, limit, offset)
+        return self.backend.list_restaurants(user_id, city, district, town, cuisine, price_level, query, limit, offset)
 
     def get_restaurant(self, restaurant_id: str) -> RestaurantResponse | None:
         return self.backend.get_restaurant(restaurant_id)
@@ -1699,8 +1947,8 @@ class RestaurantStore:
         query: str,
         user_id: str | None,
         area: str | None,
-        cuisine: str | None,
-        price_level: str | None,
+        cuisine: TextFilter,
+        price_level: TextFilter,
         tags: list[str],
         latitude: float | None,
         longitude: float | None,
@@ -1717,10 +1965,26 @@ class RestaurantStore:
         retrieved_context: list[str],
         metadata: dict[str, Any] | None = None,
     ) -> TasteAgentMessage:
+        if chat_message_store.enabled:
+            try:
+                return chat_message_store.save_message(session_id, user_id, role, content, retrieved_context, metadata)
+            except Exception as error:
+                self.chat_message_error = str(error)
         return self.backend.save_message(session_id, user_id, role, content, retrieved_context, metadata)
 
-    def list_messages(self, user_id: str | None) -> list[TasteAgentMessage]:
-        return self.backend.list_messages(user_id)
+    def list_messages(
+        self,
+        user_id: str | None,
+        session_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[TasteAgentMessage], bool]:
+        if chat_message_store.enabled:
+            try:
+                return chat_message_store.list_messages(user_id, session_id=session_id, limit=limit, offset=offset)
+            except Exception as error:
+                self.chat_message_error = str(error)
+        return self.backend.list_messages(user_id, session_id=session_id, limit=limit, offset=offset)
 
     def ensure_chat_session(self, user_id: str | None, session_id: str | None, title: str) -> str:
         return self.backend.ensure_chat_session(user_id, session_id, title)
@@ -1728,8 +1992,54 @@ class RestaurantStore:
     def touch_chat_session(self, session_id: str) -> None:
         self.backend.touch_chat_session(session_id)
 
-    def list_sessions(self, user_id: str | None) -> list[TasteAgentSession]:
-        return self.backend.list_sessions(user_id)
+    def update_chat_session_title(self, user_id: str | None, session_id: str, title: str) -> None:
+        self.backend.update_chat_session_title(user_id, session_id, title)
+
+    def list_sessions(
+        self,
+        user_id: str | None,
+        limit: int = 20,
+        offset: int = 0,
+        session_id: str | None = None,
+    ) -> tuple[list[TasteAgentSession], bool]:
+        sessions, has_more = self.backend.list_sessions(user_id, limit=limit, offset=offset, session_id=session_id)
+        if not chat_message_store.enabled:
+            return sessions, has_more
+        try:
+            session_ids = [session.id for session in sessions if session.id != "legacy"]
+            messages, _ = chat_message_store.list_messages(user_id, session_ids=session_ids, limit=1000)
+        except Exception as error:
+            self.chat_message_error = str(error)
+            return sessions, has_more
+
+        grouped: dict[str, list[TasteAgentMessage]] = {}
+        legacy_messages: list[TasteAgentMessage] = []
+        for message in messages:
+            if message.session_id:
+                grouped.setdefault(message.session_id, []).append(message)
+            else:
+                legacy_messages.append(message)
+
+        refreshed_sessions = [
+            session.model_copy(update={"messages": grouped.get(session.id, [])})
+            for session in sessions
+            if session.id != "legacy"
+        ]
+        if legacy_messages:
+            refreshed_sessions.append(
+                TasteAgentSession(
+                    id="legacy",
+                    user_id=user_id,
+                    title="이전 대화 기록",
+                    created_at=legacy_messages[0].created_at,
+                    updated_at=legacy_messages[-1].created_at,
+                    messages=legacy_messages,
+                )
+            )
+        return refreshed_sessions, has_more
+
+    def soft_delete_chat_session(self, user_id: str | None, session_id: str) -> bool:
+        return self.backend.soft_delete_chat_session(user_id, session_id)
 
 
 restaurant_store = RestaurantStore()

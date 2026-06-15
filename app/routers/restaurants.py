@@ -2,11 +2,14 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.core.dependencies import get_current_user
 from app.schemas import (
+    RestaurantChatCancelRequest,
+    RestaurantChatCancelResponse,
     RestaurantChatRequest,
     RestaurantChatResponse,
     RestaurantCreate,
@@ -22,7 +25,8 @@ from app.schemas import (
     TasteAgentSessionsResponse,
     UserResponse,
 )
-from app.services.huggingface_chat import HuggingFaceChatError, huggingface_chat_service
+from app.services.chat_cancel_store import chat_cancel_store
+from app.services.restaurant_ai import RestaurantAiError, restaurant_ai_service
 from app.services.kakao_local import KakaoLocalApiError, get_kakao_local_api_key, search_places
 from app.services.restaurant_store import restaurant_store
 
@@ -155,9 +159,11 @@ def create_restaurant(
 
 @router.get("", response_model=list[RestaurantResponse])
 def list_restaurants(
-    city: str | None = None,
-    district: str | None = None,
-    town: str | None = None,
+    city: list[str] | None = Query(default=None),
+    district: list[str] | None = Query(default=None),
+    town: list[str] | None = Query(default=None),
+    cuisine: list[str] | None = Query(default=None),
+    price_level: list[str] | None = Query(default=None),
     query: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
@@ -168,6 +174,8 @@ def list_restaurants(
         city=city,
         district=district,
         town=town,
+        cuisine=cuisine,
+        price_level=price_level,
         query=query,
         limit=limit,
         offset=offset,
@@ -259,18 +267,29 @@ def recommend_restaurants(
     payload: RestaurantRecommendationRequest,
     current_user: UserResponse = Depends(get_current_user),
 ) -> RestaurantRecommendationsResponse:
+    location_criteria = _extract_location_criteria(payload.query, payload.area)
+    area_filter = location_criteria.store_area if location_criteria else payload.area
     recommendations = restaurant_store.recommend(
         query=payload.query,
         user_id=current_user.id,
-        area=payload.area,
+        area=area_filter,
         cuisine=payload.cuisine,
         price_level=payload.price_level,
         tags=payload.tags,
         latitude=payload.latitude,
         longitude=payload.longitude,
-        limit=payload.limit,
+        limit=MAX_AI_CANDIDATES,
     )
-    return RestaurantRecommendationsResponse(query=payload.query, recommendations=recommendations)
+    recommendations, _ = _ensure_minimum_recommendations(
+        recommendations=recommendations,
+        query=payload.query,
+        effective_limit=max(payload.limit, MIN_CHAT_RECOMMENDATIONS),
+        location_criteria=location_criteria,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        used_nearby_fallback=False,
+    )
+    return RestaurantRecommendationsResponse(query=payload.query, recommendations=recommendations[: max(payload.limit, MIN_CHAT_RECOMMENDATIONS)])
 
 
 @router.post("/chat", response_model=RestaurantChatResponse)
@@ -283,13 +302,47 @@ def chat(
     requested_area = location_criteria.display if location_criteria else None
     area_filter = location_criteria.store_area if location_criteria else None
     effective_limit = max(payload.limit, MIN_CHAT_RECOMMENDATIONS)
-    session_id = restaurant_store.ensure_chat_session(current_user.id, payload.session_id, query)
+    should_update_session_title = payload.session_id is None
+    initial_title = _build_chat_session_title(query, requested_area)
+    session_id = restaurant_store.ensure_chat_session(current_user.id, payload.session_id, initial_title)
+    request_id = payload.request_id or str(uuid4())
+    chat_cancel_store.register(current_user.id, session_id, request_id)
+    try:
+        return _run_chat(payload, current_user, query, location_criteria, requested_area, area_filter, effective_limit, session_id, request_id, should_update_session_title)
+    finally:
+        chat_cancel_store.complete(request_id)
+
+
+def _run_chat(
+    payload: RestaurantChatRequest,
+    current_user: UserResponse,
+    query: str,
+    location_criteria: LocationCriteria | None,
+    requested_area: str | None,
+    area_filter: str | None,
+    effective_limit: int,
+    session_id: str,
+    request_id: str,
+    should_update_session_title: bool,
+) -> RestaurantChatResponse:
+    request_metadata = _chat_request_metadata(
+        payload=payload,
+        request_id=request_id,
+        location_criteria=location_criteria,
+        requested_area=requested_area,
+        area_filter=area_filter,
+    )
+    restaurant_store.save_message(session_id, current_user.id, "user", query, [], request_metadata)
+
+    if chat_cancel_store.is_cancelled(request_id):
+        return _cancelled_chat_response(session_id, request_id)
+
     recommendations = restaurant_store.recommend(
         query=query,
         user_id=current_user.id,
         area=area_filter,
-        cuisine=payload.cuisine,
-        price_level=payload.price_level,
+        cuisine=None,
+        price_level=None,
         tags=payload.tags,
         latitude=payload.latitude,
         longitude=payload.longitude,
@@ -297,25 +350,38 @@ def chat(
     )
     has_saved_restaurants = bool(restaurant_store.list_restaurants(user_id=current_user.id))
     used_nearby_fallback = False
-    if location_criteria and len(recommendations) < MAX_AI_CANDIDATES:
+
+    if chat_cancel_store.is_cancelled(request_id):
+        return _cancelled_chat_response(session_id, request_id)
+
+    if location_criteria and len(recommendations) < MIN_CHAT_RECOMMENDATIONS:
         area_recommendations = _build_kakao_area_recommendations(
             query=query,
-            cuisine=payload.cuisine,
+            cuisine=None,
             location_criteria=location_criteria,
             limit=MAX_AI_CANDIDATES,
         )
         if area_recommendations:
             recommendations = _merge_recommendations(recommendations, area_recommendations, MAX_AI_CANDIDATES)
             used_nearby_fallback = True
-    elif payload.latitude is not None and payload.longitude is not None and not _has_nearby_saved_recommendation(
-        recommendations,
-        payload.latitude,
-        payload.longitude,
-        NEARBY_RADIUS_KM,
+        if chat_cancel_store.is_cancelled(request_id):
+            return _cancelled_chat_response(session_id, request_id)
+    elif (
+        payload.latitude is not None
+        and payload.longitude is not None
+        and (
+            len(recommendations) < MIN_CHAT_RECOMMENDATIONS
+            or not _has_nearby_saved_recommendation(
+                recommendations,
+                payload.latitude,
+                payload.longitude,
+                NEARBY_RADIUS_KM,
+            )
+        )
     ):
         nearby_recommendations = _build_kakao_nearby_recommendations(
             query=query,
-            cuisine=payload.cuisine,
+            cuisine=None,
             latitude=payload.latitude,
             longitude=payload.longitude,
             limit=MAX_AI_CANDIDATES,
@@ -323,12 +389,25 @@ def chat(
         if nearby_recommendations:
             recommendations = _merge_recommendations(recommendations, nearby_recommendations, MAX_AI_CANDIDATES)
             used_nearby_fallback = True
-    if not recommendations and not has_saved_restaurants:
-        recommendations = _build_fallback_recommendations(query, effective_limit)
+        if chat_cancel_store.is_cancelled(request_id):
+            return _cancelled_chat_response(session_id, request_id)
+    recommendations, used_nearby_fallback = _ensure_minimum_recommendations(
+        recommendations=recommendations,
+        query=query,
+        effective_limit=effective_limit,
+        location_criteria=location_criteria,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        used_nearby_fallback=used_nearby_fallback,
+    )
     recommendations = recommendations[:MAX_AI_CANDIDATES]
+
+    if chat_cancel_store.is_cancelled(request_id):
+        return _cancelled_chat_response(session_id, request_id)
+
     rerank_error: str | None = None
     try:
-        reranked_recommendations = huggingface_chat_service.rerank_restaurant_candidates(
+        reranked_recommendations = restaurant_ai_service.rerank_restaurant_candidates(
             query=query,
             recommendations=recommendations,
             requested_area=requested_area,
@@ -337,13 +416,17 @@ def chat(
             longitude=payload.longitude,
             limit=effective_limit,
         )
-    except HuggingFaceChatError as error:
+    except RestaurantAiError as error:
         reranked_recommendations = []
         rerank_error = str(error)
     if reranked_recommendations:
         recommendations = _apply_ai_rerank(recommendations, reranked_recommendations, effective_limit)
     else:
         recommendations = recommendations[:effective_limit]
+
+    if chat_cancel_store.is_cancelled(request_id):
+        return _cancelled_chat_response(session_id, request_id)
+
     context = [
         evidence
         for recommendation in recommendations
@@ -351,23 +434,69 @@ def chat(
     ]
     answer_provider = "template"
     ai_error: str | None = None
+    ai_session_title: str | None = None
     try:
-        ai_answer = huggingface_chat_service.generate_restaurant_answer(
+        ai_completion = restaurant_ai_service.generate_restaurant_answer(
             query,
             recommendations,
             fallback=not has_saved_restaurants or used_nearby_fallback,
             requested_area=requested_area,
             area_filter=area_filter,
         )
-    except HuggingFaceChatError as error:
-        ai_answer = None
+    except RestaurantAiError as error:
+        ai_completion = None
         ai_error = str(error)
-    if ai_answer:
-        answer = ai_answer
-        answer_provider = f"huggingface:{huggingface_chat_service.model}"
+
+    if chat_cancel_store.is_cancelled(request_id):
+        return _cancelled_chat_response(session_id, request_id)
+
+    if ai_completion:
+        answer = ai_completion.answer
+        ai_session_title = ai_completion.title
+        answer_provider = f"restaurant-ai:{restaurant_ai_service.model}"
     else:
         answer = _build_answer(query, recommendations, fallback=not has_saved_restaurants or used_nearby_fallback)
-    request_metadata = {
+    if should_update_session_title and ai_session_title:
+        restaurant_store.update_chat_session_title(current_user.id, session_id, ai_session_title)
+    if chat_cancel_store.is_cancelled(request_id):
+        return _cancelled_chat_response(session_id, request_id)
+    restaurant_store.save_message(
+        session_id,
+        current_user.id,
+        "assistant",
+        answer,
+        context,
+        {
+            "request_id": request_id,
+            "recommendation_count": len(recommendations),
+            "restaurant_names": [recommendation.restaurant.name for recommendation in recommendations],
+            "recommendations": [recommendation.model_dump(mode="json") for recommendation in recommendations],
+            "answer_provider": answer_provider,
+            "session_title": ai_session_title,
+            "ai_error": ai_error,
+            "rerank_error": rerank_error,
+            "used_nearby_fallback": used_nearby_fallback,
+        },
+    )
+    restaurant_store.touch_chat_session(session_id)
+    return RestaurantChatResponse(
+        session_id=session_id,
+        request_id=request_id,
+        answer=answer,
+        recommendations=recommendations,
+        context=context,
+    )
+
+
+def _chat_request_metadata(
+    payload: RestaurantChatRequest,
+    request_id: str,
+    location_criteria: LocationCriteria | None,
+    requested_area: str | None,
+    area_filter: str | None,
+) -> dict[str, object]:
+    return {
+        "request_id": request_id,
         "area": requested_area,
         "area_filter": area_filter,
         "location_criteria": {
@@ -378,48 +507,98 @@ def chat(
         if location_criteria
         else None,
         "requested_area_source": "payload" if payload.area else ("query" if requested_area else None),
-        "cuisine": payload.cuisine,
-        "price_level": payload.price_level,
         "tags": payload.tags,
         "latitude": payload.latitude,
         "longitude": payload.longitude,
         "limit": payload.limit,
     }
-    restaurant_store.save_message(session_id, current_user.id, "user", query, [], request_metadata)
-    restaurant_store.save_message(
-        session_id,
-        current_user.id,
-        "assistant",
-        answer,
-        context,
-        {
-            "recommendation_count": len(recommendations),
-            "restaurant_names": [recommendation.restaurant.name for recommendation in recommendations],
-            "recommendations": [recommendation.model_dump(mode="json") for recommendation in recommendations],
-            "answer_provider": answer_provider,
-            "ai_error": ai_error,
-            "rerank_error": rerank_error,
-            "used_nearby_fallback": used_nearby_fallback,
-        },
-    )
+
+
+def _cancelled_chat_response(session_id: str, request_id: str) -> RestaurantChatResponse:
     restaurant_store.touch_chat_session(session_id)
-    return RestaurantChatResponse(session_id=session_id, answer=answer, recommendations=recommendations, context=context)
+    return RestaurantChatResponse(
+        session_id=session_id,
+        request_id=request_id,
+        cancelled=True,
+        answer="응답 생성을 중지했어요.",
+        recommendations=[],
+        context=[],
+    )
+
+
+@router.post("/chat/cancel", response_model=RestaurantChatCancelResponse)
+def cancel_chat(
+    payload: RestaurantChatCancelRequest,
+    current_user: UserResponse = Depends(get_current_user),
+) -> RestaurantChatCancelResponse:
+    if not payload.session_id and not payload.request_id:
+        raise HTTPException(status_code=400, detail="session_id or request_id is required")
+    cancelled = chat_cancel_store.cancel(
+        user_id=current_user.id,
+        session_id=payload.session_id,
+        request_id=payload.request_id,
+    )
+    return RestaurantChatCancelResponse(
+        cancelled=cancelled,
+        session_id=payload.session_id,
+        request_id=payload.request_id,
+    )
 
 
 @router.get("/chat/messages", response_model=TasteAgentMessagesResponse)
-def list_messages(current_user: UserResponse = Depends(get_current_user)) -> TasteAgentMessagesResponse:
+def list_messages(
+    session_id: str | None = None,
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    current_user: UserResponse = Depends(get_current_user),
+) -> TasteAgentMessagesResponse:
+    messages, has_more = restaurant_store.list_messages(
+        current_user.id,
+        session_id=session_id,
+        limit=limit,
+        offset=offset,
+    )
     return TasteAgentMessagesResponse(
         user_id=current_user.id,
-        messages=restaurant_store.list_messages(current_user.id),
+        messages=messages,
+        limit=limit,
+        offset=offset,
+        has_more=has_more,
     )
 
 
 @router.get("/chat/sessions", response_model=TasteAgentSessionsResponse)
-def list_sessions(current_user: UserResponse = Depends(get_current_user)) -> TasteAgentSessionsResponse:
+def list_sessions(
+    session_id: str | None = None,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    current_user: UserResponse = Depends(get_current_user),
+) -> TasteAgentSessionsResponse:
+    sessions, has_more = restaurant_store.list_sessions(
+        current_user.id,
+        limit=limit,
+        offset=offset,
+        session_id=session_id,
+    )
     return TasteAgentSessionsResponse(
         user_id=current_user.id,
-        sessions=restaurant_store.list_sessions(current_user.id),
+        sessions=sessions,
+        limit=limit,
+        offset=offset,
+        has_more=has_more,
     )
+
+
+@router.delete("/chat/sessions/{session_id}", status_code=204)
+def delete_chat_session(
+    session_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+) -> None:
+    if session_id == "legacy":
+        raise HTTPException(status_code=400, detail="Legacy chat history cannot be deleted from here")
+    deleted = restaurant_store.soft_delete_chat_session(current_user.id, session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Chat session not found")
 
 
 @router.get("/{restaurant_id}", response_model=RestaurantResponse)
@@ -431,6 +610,49 @@ def get_restaurant(
     if restaurant is None or restaurant.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Restaurant not found")
     return restaurant
+
+
+def _ensure_minimum_recommendations(
+    recommendations: list[RestaurantRecommendation],
+    query: str,
+    effective_limit: int,
+    location_criteria: LocationCriteria | None,
+    latitude: float | None,
+    longitude: float | None,
+    used_nearby_fallback: bool,
+) -> tuple[list[RestaurantRecommendation], bool]:
+    minimum = max(MIN_CHAT_RECOMMENDATIONS, effective_limit)
+    if len(recommendations) >= minimum:
+        return recommendations, used_nearby_fallback
+
+    if location_criteria:
+        area_recommendations = _build_kakao_area_recommendations(
+            query=query,
+            cuisine=None,
+            location_criteria=location_criteria,
+            limit=MAX_AI_CANDIDATES,
+        )
+        if area_recommendations:
+            recommendations = _merge_recommendations(recommendations, area_recommendations, MAX_AI_CANDIDATES)
+            used_nearby_fallback = True
+
+    if len(recommendations) < minimum and latitude is not None and longitude is not None:
+        nearby_recommendations = _build_kakao_nearby_recommendations(
+            query=query,
+            cuisine=None,
+            latitude=latitude,
+            longitude=longitude,
+            limit=MAX_AI_CANDIDATES,
+        )
+        if nearby_recommendations:
+            recommendations = _merge_recommendations(recommendations, nearby_recommendations, MAX_AI_CANDIDATES)
+            used_nearby_fallback = True
+
+    if len(recommendations) < minimum:
+        fallback_recommendations = _build_fallback_recommendations(query, minimum)
+        recommendations = _merge_recommendations(recommendations, fallback_recommendations, minimum)
+
+    return recommendations[:minimum], used_nearby_fallback
 
 
 def _build_answer(query: str, recommendations, fallback: bool = False) -> str:
@@ -450,13 +672,15 @@ def _build_answer(query: str, recommendations, fallback: bool = False) -> str:
     ]
     for index, recommendation in enumerate(recommendations, start=1):
         restaurant = recommendation.restaurant
+        is_external_candidate = restaurant.id.startswith("kakao-") or restaurant.note_count == 0
         evidence = recommendation.evidence[0] if recommendation.evidence else "저장된 메모가 이 조건과 유사합니다."
+        evidence_label = "장소 특징" if is_external_candidate else "근거 메모"
         lines.extend(
             [
                 f"{index}. {restaurant.name}",
                 f"- 지역/종류: {restaurant.area} · {restaurant.cuisine} · {restaurant.price_level}",
                 f"- 추천 이유: {recommendation.reason}",
-                f"- 근거 메모: {evidence}",
+                f"- {evidence_label}: {evidence}",
                 f"- {recommendation.menu_tip}",
                 f"- 주의: {recommendation.caution}",
             ]
@@ -479,7 +703,7 @@ def _build_kakao_area_recommendations(
     return _recommendations_from_kakao_places(
         places=places,
         limit=limit,
-        reason_prefix=f"{search_area}에 저장된 맛집 후보가 부족해 카카오 장소 검색에서 찾은",
+        reason_prefix=f"{search_area} 지역 조건에 맞는",
     )
 
 
@@ -510,7 +734,7 @@ def _build_kakao_nearby_recommendations(
     return _recommendations_from_kakao_places(
         places=places,
         limit=limit,
-        reason_prefix="근방에 저장된 맛집이 없어 카카오 장소 검색에서 찾은",
+        reason_prefix="현재 위치에서 가깝게 들르기 좋은",
         latitude=latitude,
         longitude=longitude,
     )
@@ -534,7 +758,7 @@ def _recommendations_from_kakao_places(
         latitude_value = _parse_float(place.y)
         longitude_value = _parse_float(place.x)
         distance = _distance_km(latitude, longitude, latitude_value, longitude_value)
-        distance_hint = f" 현재 위치에서 약 {distance:.1f}km 거리입니다." if distance is not None else ""
+        distance_hint = f" 현재 위치에서 약 {distance:.1f}km 거리라 이동 부담이 적어요." if distance is not None else ""
         restaurant = RestaurantResponse(
             id=f"kakao-{place.id}",
             user_id=None,
@@ -560,7 +784,7 @@ def _recommendations_from_kakao_places(
         recommendations.append(
             RestaurantRecommendation(
                 restaurant=restaurant,
-                reason=f"{reason_prefix} {index}순위 후보입니다.{distance_hint}",
+                reason=f"{reason_prefix} {cuisine_name} 후보입니다.{distance_hint}",
                 evidence=[
                     _build_kakao_recommendation_reason(place.place_name, cuisine_name, area, distance)
                 ],
@@ -791,6 +1015,36 @@ def _distance_km(
     return earth_radius_km * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
+def _build_chat_session_title(query: str, requested_area: str | None) -> str:
+    text = re.sub(r"\s+", " ", query).strip()
+    if not text:
+        return "맛집 추천"
+
+    _ = requested_area
+    replacements = [
+        (r"(지금|오늘|내일|이번|근처에\s*있는|근처\s*있는)", " "),
+        (r"(맛집|식당|음식점)\s*(좀|추천|검색|찾기)?", "맛집"),
+        (r"(찾아줘|추천해줘|골라줘|알려줘|찾아\s*줘|추천\s*해줘|골라\s*줘|알려\s*줘)", " "),
+        (r"(해줘|해\s*줘|줘|요|요\.)$", " "),
+        (r"[?.!,~]+", " "),
+    ]
+    for pattern, replacement in replacements:
+        text = re.sub(pattern, replacement, text)
+
+    text = re.sub(r"([가-힣]{2,})하기", r"\1", text)
+    text = re.sub(r"([가-힣]{2,})(에서|으로|로)\b", r"\1", text)
+    text = re.sub(r"\b곳\b", " ", text)
+    text = re.sub(r"\b(있는|좋은|괜찮은|가까운)\b", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" -_/·")
+
+    if not text or text in {"맛집", "근처", "근처 맛집"}:
+        text = "근처 맛집 추천" if "근처" in query else "맛집 추천"
+    elif "맛집" not in text:
+        text = f"{text} 맛집"
+
+    return text[:24].strip() or "맛집 추천"
+
+
 def _build_fallback_recommendations(query: str, limit: int) -> list[RestaurantRecommendation]:
     created_at = datetime.now(timezone.utc).isoformat()
     query_hint = query.strip() or "오늘 식사"
@@ -867,3 +1121,4 @@ def _build_fallback_recommendations(query: str, limit: int) -> list[RestaurantRe
             )
         )
     return recommendations
+
