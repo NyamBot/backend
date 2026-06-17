@@ -11,7 +11,6 @@ class HealthResponse(BaseModel):
     vector_store: str
     chat_message_store: str
     chat_message_error: str | None = None
-    database_url: str
 
 
 class UserCreate(BaseModel):
