@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nyambot-backend-config
+data:
+  APP_ENV: prod
+  API_PREFIX: /api/v1
+  FRONTEND_URL: https://nyambot.kro.kr
+  CHAT_MESSAGE_BACKEND: opensearch
+  OPENSEARCH_URL: http://opensearch:9200
+  OPENSEARCH_CHAT_MESSAGES_INDEX: nyambot-chat-messages
+  OPENSEARCH_VERIFY_CERTS: "false"
+  HUGGINGFACE_RERANK_ENABLED: "true"

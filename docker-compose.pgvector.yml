@@ -1,8 +1,6 @@
 services:
   pgvector:
-    build:
-      context: ./infra/pgvector
-    image: nyambot-pgvector:latest
+    image: pgvector/pgvector:pg16
     container_name: nyambot-pgvector
     environment:
       POSTGRES_DB: nyambot

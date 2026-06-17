@@ -9,3 +9,7 @@ __pycache__/
 *.md
 !docs/
 !docs/*.md
+infra/k8s/**/secret.yaml
+infra/k8s/**/secret.*.yaml
+infra/k8s/**/secret.yml
+infra/k8s/**/secret.*.yml

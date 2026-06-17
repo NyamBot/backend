@@ -12,7 +12,11 @@ app.add_exception_handler(AppError, app_error_handler)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        settings.frontend_url,
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -31,5 +35,4 @@ def health() -> HealthResponse:
         vector_store=restaurant_store.backend_name,
         chat_message_store=settings.chat_message_backend,
         chat_message_error=restaurant_store.chat_message_error,
-        database_url=settings.database_url,
     )
