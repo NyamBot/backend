@@ -6,4 +6,4 @@ resources:
   - ingress.yaml
 images:
   - name: ghcr.io/nyambot/backend
-    newTag: prod
+    newTag: 6d22b5f2e6efb21e8a8d67a8fb7fb56a58ecff6e
