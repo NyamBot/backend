@@ -3,8 +3,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from app.repositories.restaurant_repository import restaurant_store
 from app.services.chat_message_queue import chat_message_queue
+from app.services.restaurant_store import restaurant_store
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
