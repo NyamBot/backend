@@ -3,4 +3,7 @@ kind: Kustomization
 resources:
   - configmap.yaml
   - deployment.yaml
+  - rabbitmq-deployment.yaml
+  - rabbitmq-service.yaml
   - service.yaml
+  - worker-deployment.yaml

@@ -40,7 +40,7 @@ class OpenSearchChatMessageStore:
             "metadata": metadata or {},
             "created_at": created_at,
         }
-        self._client.index(index=self.index_name, id=message_id, body=document, refresh=True)
+        self._client.index(index=self.index_name, id=message_id, body=document)
         return self._message_from_document(document)
 
     def list_messages(

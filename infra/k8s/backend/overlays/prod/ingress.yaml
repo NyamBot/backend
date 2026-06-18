@@ -3,11 +3,16 @@ kind: Ingress
 metadata:
   name: nyambot-backend
   annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-http01
     nginx.ingress.kubernetes.io/proxy-body-size: "10m"
 spec:
   ingressClassName: nginx
+  tls:
+    - hosts:
+        - nyambot.n-e.kr
+      secretName: nyambot-backend-tls
   rules:
-    - host: nyambot.kro.kr
+    - host: nyambot.n-e.kr
       http:
         paths:
           - path: /api

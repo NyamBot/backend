@@ -1,4 +1,53 @@
+name: nyambot_backend
+
 services:
+  backend:
+    build:
+      context: .
+    container_name: nyambot-backend
+    env_file:
+      - .env.dev
+    environment:
+      DATABASE_URL: postgresql://nyambot:nyambot@pgvector:5432/nyambot
+      OPENSEARCH_URL: http://opensearch:9200
+      CHAT_MESSAGE_QUEUE_ENABLED: "true"
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USERNAME: nyambot
+      RABBITMQ_PASSWORD: nyambot
+    ports:
+      - "8000:8000"
+    depends_on:
+      pgvector:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  chat-message-worker:
+    build:
+      context: .
+    container_name: nyambot-chat-message-worker
+    command: ["python", "-m", "app.workers.chat_message_worker"]
+    env_file:
+      - .env.dev
+    environment:
+      DATABASE_URL: postgresql://nyambot:nyambot@pgvector:5432/nyambot
+      OPENSEARCH_URL: http://opensearch:9200
+      CHAT_MESSAGE_QUEUE_ENABLED: "true"
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USERNAME: nyambot
+      RABBITMQ_PASSWORD: nyambot
+    depends_on:
+      pgvector:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
   pgvector:
     image: pgvector/pgvector:pg16
     container_name: nyambot-pgvector
@@ -31,6 +80,21 @@ services:
       - nyambot-opensearch-data:/usr/share/opensearch/data
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: nyambot-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: nyambot
+      RABBITMQ_DEFAULT_PASS: nyambot
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s
       timeout: 5s
       retries: 12
