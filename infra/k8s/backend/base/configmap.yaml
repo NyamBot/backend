@@ -5,7 +5,7 @@ metadata:
 data:
   APP_ENV: prod
   API_PREFIX: /api/v1
-  FRONTEND_URL: https://nyambot.kro.kr
+  FRONTEND_URL: https://nyambot.vercel.app
   CHAT_MESSAGE_BACKEND: opensearch
   OPENSEARCH_URL: http://opensearch:9200
   OPENSEARCH_CHAT_MESSAGES_INDEX: nyambot-chat-messages
