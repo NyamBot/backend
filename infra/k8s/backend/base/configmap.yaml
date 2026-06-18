@@ -10,4 +10,9 @@ data:
   OPENSEARCH_URL: http://opensearch:9200
   OPENSEARCH_CHAT_MESSAGES_INDEX: nyambot-chat-messages
   OPENSEARCH_VERIFY_CERTS: "false"
+  CHAT_MESSAGE_QUEUE_ENABLED: "true"
+  CHAT_MESSAGE_QUEUE_NAME: nyambot-chat-message-save
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_PORT: "5672"
+  RABBITMQ_VHOST: /
   HUGGINGFACE_RERANK_ENABLED: "true"

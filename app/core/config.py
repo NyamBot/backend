@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     opensearch_password: str | None = None
     opensearch_chat_messages_index: str = "nyambot-chat-messages"
     opensearch_verify_certs: bool = False
+    chat_message_queue_enabled: bool = False
+    chat_message_queue_name: str = "nyambot-chat-message-save"
+    rabbitmq_host: str = "localhost"
+    rabbitmq_port: int = 5672
+    rabbitmq_username: str | None = None
+    rabbitmq_password: str | None = None
+    rabbitmq_vhost: str = "/"
+    rabbitmq_retry_delay_seconds: float = 2.0
 
     model_config = SettingsConfigDict(
         env_file=(".env", f".env.{APP_ENV}"),

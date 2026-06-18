@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, Query
 
 from app.core.dependencies import get_current_user
 from app.core.errors import AppError, ErrorCode
@@ -27,6 +27,7 @@ from app.schemas import (
     UserResponse,
 )
 from app.services.chat_cancel_store import chat_cancel_store
+from app.services.chat_message_queue import chat_message_queue
 from app.services.restaurant_ai import RestaurantAiError, restaurant_ai_service
 from app.services.kakao_local import KakaoLocalApiError, get_kakao_local_api_key, search_places
 from app.services.restaurant_store import restaurant_store
@@ -296,6 +297,7 @@ def recommend_restaurants(
 @router.post("/chat", response_model=RestaurantChatResponse)
 def chat(
     payload: RestaurantChatRequest,
+    background_tasks: BackgroundTasks,
     current_user: UserResponse = Depends(get_current_user),
 ) -> RestaurantChatResponse:
     query = payload.message or payload.query
@@ -309,7 +311,19 @@ def chat(
     request_id = payload.request_id or str(uuid4())
     chat_cancel_store.register(current_user.id, session_id, request_id)
     try:
-        return _run_chat(payload, current_user, query, location_criteria, requested_area, area_filter, effective_limit, session_id, request_id, should_update_session_title)
+        return _run_chat(
+            payload,
+            current_user,
+            query,
+            location_criteria,
+            requested_area,
+            area_filter,
+            effective_limit,
+            session_id,
+            request_id,
+            should_update_session_title,
+            background_tasks,
+        )
     finally:
         chat_cancel_store.complete(request_id)
 
@@ -325,6 +339,7 @@ def _run_chat(
     session_id: str,
     request_id: str,
     should_update_session_title: bool,
+    background_tasks: BackgroundTasks,
 ) -> RestaurantChatResponse:
     request_metadata = _chat_request_metadata(
         payload=payload,
@@ -333,7 +348,15 @@ def _run_chat(
         requested_area=requested_area,
         area_filter=area_filter,
     )
-    restaurant_store.save_message(session_id, current_user.id, "user", query, [], request_metadata)
+    _queue_chat_message_save(
+        background_tasks,
+        session_id,
+        current_user.id,
+        "user",
+        query,
+        [],
+        request_metadata,
+    )
 
     if chat_cancel_store.is_cancelled(request_id):
         return _cancelled_chat_response(session_id, request_id)
@@ -461,7 +484,8 @@ def _run_chat(
         restaurant_store.update_chat_session_title(current_user.id, session_id, ai_session_title)
     if chat_cancel_store.is_cancelled(request_id):
         return _cancelled_chat_response(session_id, request_id)
-    restaurant_store.save_message(
+    _queue_chat_message_save(
+        background_tasks,
         session_id,
         current_user.id,
         "assistant",
@@ -487,6 +511,50 @@ def _run_chat(
         recommendations=recommendations,
         context=context,
     )
+
+
+def _queue_chat_message_save(
+    background_tasks: BackgroundTasks,
+    session_id: str,
+    user_id: str | None,
+    role: str,
+    content: str,
+    retrieved_context: list[str],
+    metadata: dict[str, object] | None = None,
+) -> None:
+    background_tasks.add_task(
+        _publish_or_save_chat_message,
+        session_id,
+        user_id,
+        role,
+        content,
+        retrieved_context,
+        metadata,
+    )
+
+
+def _publish_or_save_chat_message(
+    session_id: str,
+    user_id: str | None,
+    role: str,
+    content: str,
+    retrieved_context: list[str],
+    metadata: dict[str, object] | None = None,
+) -> None:
+    try:
+        if chat_message_queue.publish_save_message(
+            session_id=session_id,
+            user_id=user_id,
+            role=role,
+            content=content,
+            retrieved_context=retrieved_context,
+            metadata=metadata,
+        ):
+            return
+    except Exception as error:
+        restaurant_store.chat_message_error = str(error)
+
+    restaurant_store.save_message(session_id, user_id, role, content, retrieved_context, metadata)
 
 
 def _chat_request_metadata(
