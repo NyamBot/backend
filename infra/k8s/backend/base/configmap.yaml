@@ -8,7 +8,7 @@ data:
   FRONTEND_URL: https://nyambot.vercel.app
   CHAT_MESSAGE_BACKEND: opensearch
   OPENSEARCH_URL: http://opensearch:9200
-  OPENSEARCH_CHAT_MESSAGES_INDEX: nyambot-chat-messages
+  OPENSEARCH_CHAT_MESSAGES_INDEX: nyambot-chat
   OPENSEARCH_VERIFY_CERTS: "false"
   CHAT_MESSAGE_QUEUE_ENABLED: "true"
   CHAT_MESSAGE_QUEUE_NAME: nyambot-chat-message-save

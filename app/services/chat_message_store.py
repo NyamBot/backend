@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -8,11 +8,14 @@ from app.core.config import settings
 from app.schemas import TasteAgentMessage
 
 
+_INDEX_TIMEZONE = timezone(timedelta(hours=9))
+
+
 class OpenSearchChatMessageStore:
     def __init__(self) -> None:
-        self.index_name = settings.opensearch_chat_messages_index
+        self.index_prefix = settings.opensearch_chat_messages_index.rstrip("-")
         self._client: Any | None = None
-        self._index_ready = False
+        self._ready_indices: set[str] = set()
 
     @property
     def enabled(self) -> bool:
@@ -27,9 +30,11 @@ class OpenSearchChatMessageStore:
         retrieved_context: list[str],
         metadata: dict[str, Any] | None = None,
     ) -> TasteAgentMessage:
-        self._ensure_index()
         message_id = str(uuid4())
-        created_at = datetime.now(timezone.utc).isoformat()
+        created_at_datetime = datetime.now(timezone.utc)
+        created_at = created_at_datetime.isoformat()
+        index_name = self._index_name_for_datetime(created_at_datetime)
+        self._ensure_index(index_name)
         document = {
             "id": message_id,
             "session_id": session_id,
@@ -40,7 +45,7 @@ class OpenSearchChatMessageStore:
             "metadata": metadata or {},
             "created_at": created_at,
         }
-        self._client.index(index=self.index_name, id=message_id, body=document)
+        self._client.index(index=index_name, id=message_id, body=document)
         return self._message_from_document(document)
 
     def list_messages(
@@ -51,7 +56,6 @@ class OpenSearchChatMessageStore:
         limit: int = 100,
         offset: int = 0,
     ) -> tuple[list[TasteAgentMessage], bool]:
-        self._ensure_index()
         filters: list[dict[str, Any]] = []
         if user_id:
             filters.append({"term": {"user_id": user_id}})
@@ -65,35 +69,38 @@ class OpenSearchChatMessageStore:
         else:
             query = {"match_all": {}}
         page_size = max(limit, 0) + 1
-        response = self._client.search(
-            index=self.index_name,
+        client = self._get_client()
+        response = client.search(
+            index=self._search_index_pattern(),
             body={
                 "query": query,
                 "sort": [{"created_at": {"order": "asc"}}],
                 "from": max(offset, 0),
                 "size": page_size,
             },
+            ignore_unavailable=True,
         )
         hits = response.get("hits", {}).get("hits", [])
         messages = [self._message_from_document(hit["_source"]) for hit in hits[:limit]]
         return messages, len(hits) > limit
 
     def delete_user_messages(self, user_id: str) -> None:
-        self._ensure_index()
-        self._client.delete_by_query(
-            index=self.index_name,
+        client = self._get_client()
+        client.delete_by_query(
+            index=self._search_index_pattern(),
             body={"query": {"term": {"user_id": user_id}}},
             refresh=True,
             conflicts="proceed",
+            ignore_unavailable=True,
         )
 
-    def _ensure_index(self) -> None:
-        if self._index_ready:
+    def _ensure_index(self, index_name: str) -> None:
+        if index_name in self._ready_indices:
             return
         client = self._get_client()
-        if not client.indices.exists(index=self.index_name):
+        if not client.indices.exists(index=index_name):
             client.indices.create(
-                index=self.index_name,
+                index=index_name,
                 body={
                     "mappings": {
                         "properties": {
@@ -109,7 +116,15 @@ class OpenSearchChatMessageStore:
                     }
                 },
             )
-        self._index_ready = True
+        self._ready_indices.add(index_name)
+
+    def _index_name_for_datetime(self, created_at: datetime) -> str:
+        partition_time = created_at.astimezone(_INDEX_TIMEZONE)
+        suffix = "0106" if partition_time.month <= 6 else "0712"
+        return f"{self.index_prefix}-{partition_time.year}-{suffix}"
+
+    def _search_index_pattern(self) -> str:
+        return f"{self.index_prefix}-*"
 
     def _get_client(self):
         if self._client is not None:
