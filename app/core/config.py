@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     opensearch_url: str = "http://127.0.0.1:9200"
     opensearch_username: str | None = None
     opensearch_password: str | None = None
-    opensearch_chat_messages_index: str = "nyambot-chat-messages"
+    opensearch_chat_messages_index: str = "nyambot-chat"
     opensearch_verify_certs: bool = False
     chat_message_queue_enabled: bool = False
     chat_message_queue_name: str = "nyambot-chat-message-save"
