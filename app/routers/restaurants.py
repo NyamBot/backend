@@ -39,28 +39,7 @@ NEARBY_RADIUS_KM = NEARBY_RADIUS_METERS / 1000
 MIN_CHAT_RECOMMENDATIONS = 3
 MAX_AI_CANDIDATES = 12
 KAKAO_SEARCH_SIZE = 15
-RERANK_MIN_CANDIDATES = 4
 RERANK_MAX_CANDIDATES = 8
-RERANK_COMPLEX_QUERY_MIN_WORDS = 4
-RERANK_INTENT_KEYWORDS = (
-    "\ud63c\ubc25",  # honbap
-    "\ub370\uc774\ud2b8",  # date
-    "\uc870\uc6a9",  # quiet
-    "\uac00\uc131\ube44",  # value for money
-    "\ubd84\uc704\uae30",  # atmosphere
-    "\uc544\uc774",  # with kids
-    "\uac00\uc871",  # family
-    "\ubd80\ubaa8\ub2d8",  # parents
-    "\ud68c\uc2dd",  # team dinner
-    "\uc18c\uac1c\ud305",  # blind date
-    "\uae30\ub150\uc77c",  # anniversary
-    "\ube44\uc624\ub294",  # rainy
-    "\ub9e4\uc6b4",  # spicy
-    "\uae54\ub054",  # neat
-    "\uc220\uc9d1",  # bar
-    "\uc57c\uc2dd",  # late-night meal
-    "\ube0c\ub7f0\uce58",  # brunch
-)
 
 
 @dataclass(frozen=True)
@@ -454,7 +433,7 @@ def _run_chat(
     rerank_error: str | None = None
     rerank_attempted = False
     rerank_candidate_count = 0
-    if _should_use_ai_rerank(query, payload.tags, recommendations, effective_limit):
+    if payload.search_mode == "advanced" and recommendations:
         rerank_attempted = True
         rerank_candidates = recommendations[:RERANK_MAX_CANDIDATES]
         rerank_candidate_count = len(rerank_candidates)
@@ -529,6 +508,7 @@ def _run_chat(
             "answer_provider": answer_provider,
             "session_title": ai_session_title,
             "ai_error": ai_error,
+            "search_mode": payload.search_mode,
             "rerank_error": rerank_error,
             "rerank_attempted": rerank_attempted,
             "rerank_used": bool(reranked_recommendations),
@@ -613,6 +593,7 @@ def _chat_request_metadata(
         "latitude": payload.latitude,
         "longitude": payload.longitude,
         "limit": payload.limit,
+        "search_mode": payload.search_mode,
     }
 
 
@@ -965,23 +946,6 @@ def _merge_recommendations(
         if len(merged) >= limit:
             break
     return merged
-
-
-def _should_use_ai_rerank(
-    query: str,
-    tags: list[str],
-    recommendations: list[RestaurantRecommendation],
-    limit: int,
-) -> bool:
-    if len(recommendations) < RERANK_MIN_CANDIDATES or len(recommendations) <= limit:
-        return False
-    if tags:
-        return True
-
-    normalized_query = query.lower().replace(" ", "")
-    if any(keyword in normalized_query for keyword in RERANK_INTENT_KEYWORDS):
-        return True
-    return len(query.split()) >= RERANK_COMPLEX_QUERY_MIN_WORDS
 
 
 def _apply_ai_rerank(
