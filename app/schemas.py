@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -205,6 +205,7 @@ class RestaurantChatRequest(BaseModel):
     latitude: float | None = None
     longitude: float | None = None
     limit: int = Field(default=3, ge=1, le=5)
+    search_mode: Literal["normal", "advanced"] = "normal"
     session_id: str | None = None
     request_id: str | None = None
 
