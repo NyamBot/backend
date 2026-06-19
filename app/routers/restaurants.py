@@ -41,6 +41,39 @@ MAX_AI_CANDIDATES = 12
 KAKAO_SEARCH_SIZE = 15
 RERANK_MAX_CANDIDATES = 8
 
+FOOD_RECOMMENDATION_TERMS = {
+    "맛집",
+    "식당",
+    "음식",
+    "메뉴",
+    "밥",
+    "먹",
+    "배고",
+    "점심",
+    "저녁",
+    "아침",
+    "브런치",
+    "야식",
+    "혼밥",
+    "회식",
+    "데이트",
+    "카페",
+    "디저트",
+    "술집",
+    "한식",
+    "중식",
+    "일식",
+    "양식",
+    "분식",
+    "고기",
+    "국밥",
+    "라멘",
+    "파스타",
+    "피자",
+    "치킨",
+    "초밥",
+}
+
 
 @dataclass(frozen=True)
 class LocationCriteria:
@@ -362,6 +395,15 @@ def _run_chat(
     if chat_cancel_store.is_cancelled(request_id):
         return _cancelled_chat_response(session_id, request_id)
 
+    if not _is_food_recommendation_query(query):
+        return _out_of_scope_chat_response(
+            background_tasks=background_tasks,
+            session_id=session_id,
+            user_id=current_user.id,
+            request_id=request_id,
+            search_mode=payload.search_mode,
+        )
+
     recommendations = restaurant_store.recommend(
         query=query,
         user_id=current_user.id,
@@ -595,6 +637,50 @@ def _chat_request_metadata(
         "limit": payload.limit,
         "search_mode": payload.search_mode,
     }
+
+
+def _is_food_recommendation_query(query: str) -> bool:
+    normalized = re.sub(r"\s+", "", query.lower())
+    return any(term in normalized for term in FOOD_RECOMMENDATION_TERMS)
+
+
+def _out_of_scope_chat_response(
+    background_tasks: BackgroundTasks,
+    session_id: str,
+    user_id: str | None,
+    request_id: str,
+    search_mode: str,
+) -> RestaurantChatResponse:
+    answer = (
+        "저는 맛집 추천을 도와드리는 NyamBot이에요. "
+        "지역, 메뉴, 분위기, 상황을 넣어서 물어봐 주세요. "
+        "예를 들면 '강남에서 혼밥하기 좋은 한식 추천해줘'처럼요."
+    )
+    _queue_chat_message_save(
+        background_tasks,
+        session_id,
+        user_id,
+        "assistant",
+        answer,
+        [],
+        {
+            "request_id": request_id,
+            "recommendation_count": 0,
+            "restaurant_names": [],
+            "recommendations": [],
+            "answer_provider": "guardrail",
+            "search_mode": search_mode,
+            "out_of_scope": True,
+        },
+    )
+    restaurant_store.touch_chat_session(session_id)
+    return RestaurantChatResponse(
+        session_id=session_id,
+        request_id=request_id,
+        answer=answer,
+        recommendations=[],
+        context=[],
+    )
 
 
 def _cancelled_chat_response(session_id: str, request_id: str) -> RestaurantChatResponse:
