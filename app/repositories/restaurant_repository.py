@@ -148,6 +148,73 @@ def _embedding_to_pgvector(vector: list[float]) -> str:
     return "[" + ",".join(str(value) for value in vector) + "]"
 
 
+def _clean_search_values(values: list[Any]) -> list[str]:
+    cleaned: list[str] = []
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, list):
+            cleaned.extend(_clean_search_values(value))
+            continue
+        text = str(value).strip()
+        if text:
+            cleaned.append(text)
+    return cleaned
+
+
+def _build_restaurant_search_document(
+    *,
+    name: str,
+    area: str,
+    city: str | None,
+    district: str | None,
+    town: str | None,
+    cuisine: str,
+    price_level: str,
+    mood_tags: list[str],
+    signature_menus: list[str],
+    address: str | None,
+    road_address: str | None,
+    note_content: str,
+    note_tags: list[str],
+) -> str:
+    sections = [
+        ("식당명", [name]),
+        ("지역", [area, city, district, town]),
+        ("주소", [road_address, address]),
+        ("음식 종류", [cuisine]),
+        ("가격대", [price_level]),
+        ("태그", mood_tags),
+        ("대표 메뉴", signature_menus),
+        ("리뷰", [note_content]),
+        ("검색 태그", note_tags),
+    ]
+    lines = []
+    for label, values in sections:
+        cleaned = _clean_search_values(values)
+        if cleaned:
+            lines.append(f"{label}: {' '.join(cleaned)}")
+    return "\n".join(lines)
+
+
+def _build_restaurant_search_document_from_row(row: Any, note_content: str, note_tags: list[str]) -> str:
+    return _build_restaurant_search_document(
+        name=row["name"],
+        area=row["area"],
+        city=row["city"],
+        district=row["district"],
+        town=row["town"],
+        cuisine=row["cuisine"],
+        price_level=row["price_level"],
+        mood_tags=_json_list(row["mood_tags_json"]),
+        signature_menus=_json_list(row["signature_menus_json"]),
+        address=row["address"],
+        road_address=row["road_address"],
+        note_content=note_content,
+        note_tags=note_tags,
+    )
+
+
 def _json_list(value: Any) -> list[str]:
     if value is None:
         return []
@@ -450,6 +517,21 @@ class SqliteRestaurantStore:
         restaurant_id = str(uuid4())
         note_id = str(uuid4())
         note_tags = sorted(set(payload.mood_tags + [payload.area, payload.cuisine, payload.price_level]))
+        search_document = _build_restaurant_search_document(
+            name=payload.name,
+            area=payload.area,
+            city=payload.city,
+            district=payload.district,
+            town=payload.town,
+            cuisine=payload.cuisine,
+            price_level=payload.price_level,
+            mood_tags=payload.mood_tags,
+            signature_menus=payload.signature_menus,
+            address=payload.address,
+            road_address=payload.road_address,
+            note_content=payload.note,
+            note_tags=note_tags,
+        )
         with self._connect() as connection:
             connection.execute(
                 """
@@ -492,7 +574,7 @@ class SqliteRestaurantStore:
                     restaurant_id,
                     payload.note,
                     json.dumps(note_tags, ensure_ascii=False),
-                    json.dumps(_embed(payload.note), ensure_ascii=False),
+                    json.dumps(_embed(search_document), ensure_ascii=False),
                 ),
             )
         restaurant = self.get_restaurant(restaurant_id)
@@ -506,6 +588,21 @@ class SqliteRestaurantStore:
             return None
         note_id = str(uuid4())
         note_tags = sorted(set(payload.tags + restaurant.mood_tags + [restaurant.area, restaurant.cuisine, restaurant.price_level]))
+        search_document = _build_restaurant_search_document(
+            name=restaurant.name,
+            area=restaurant.area,
+            city=restaurant.city,
+            district=restaurant.district,
+            town=restaurant.town,
+            cuisine=restaurant.cuisine,
+            price_level=restaurant.price_level,
+            mood_tags=restaurant.mood_tags,
+            signature_menus=restaurant.signature_menus,
+            address=restaurant.address,
+            road_address=restaurant.road_address,
+            note_content=payload.content,
+            note_tags=note_tags,
+        )
         with self._connect() as connection:
             connection.execute(
                 """
@@ -518,10 +615,36 @@ class SqliteRestaurantStore:
                     restaurant_id,
                     payload.content,
                     json.dumps(note_tags, ensure_ascii=False),
-                    json.dumps(_embed(payload.content), ensure_ascii=False),
+                    json.dumps(_embed(search_document), ensure_ascii=False),
                 ),
             )
         return self.get_restaurant(restaurant_id)
+
+    def rebuild_search_embeddings(self, restaurant_id: str | None = None) -> int:
+        where_clause = "WHERE restaurants.id = ?" if restaurant_id else ""
+        params: tuple[Any, ...] = (restaurant_id,) if restaurant_id else ()
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT restaurants.*, restaurant_notes.id AS note_id,
+                    restaurant_notes.content, restaurant_notes.tags_json
+                FROM restaurant_notes
+                JOIN restaurants ON restaurants.id = restaurant_notes.restaurant_id
+                {where_clause}
+                """,
+                params,
+            ).fetchall()
+            for row in rows:
+                search_document = _build_restaurant_search_document_from_row(
+                    row,
+                    row["content"],
+                    _json_list(row["tags_json"]),
+                )
+                connection.execute(
+                    "UPDATE restaurant_notes SET embedding_json = ? WHERE id = ?",
+                    (json.dumps(_embed(search_document), ensure_ascii=False), row["note_id"]),
+                )
+            return len(rows)
 
     def list_restaurants(
         self,
@@ -644,6 +767,7 @@ class SqliteRestaurantStore:
             )
             if cursor.rowcount == 0:
                 return None
+        self.rebuild_search_embeddings(restaurant_id)
         return self.get_restaurant(restaurant_id)
 
     def delete_restaurant(self, restaurant_id: str) -> bool:
@@ -1131,6 +1255,21 @@ class PgRestaurantStore(SqliteRestaurantStore):
         restaurant_id = str(uuid4())
         note_id = str(uuid4())
         note_tags = sorted(set(payload.mood_tags + [payload.area, payload.cuisine, payload.price_level]))
+        search_document = _build_restaurant_search_document(
+            name=payload.name,
+            area=payload.area,
+            city=payload.city,
+            district=payload.district,
+            town=payload.town,
+            cuisine=payload.cuisine,
+            price_level=payload.price_level,
+            mood_tags=payload.mood_tags,
+            signature_menus=payload.signature_menus,
+            address=payload.address,
+            road_address=payload.road_address,
+            note_content=payload.note,
+            note_tags=note_tags,
+        )
         with self._connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -1174,7 +1313,7 @@ class PgRestaurantStore(SqliteRestaurantStore):
                         restaurant_id,
                         payload.note,
                         json.dumps(note_tags, ensure_ascii=False),
-                        _embedding_to_pgvector(_embed(payload.note)),
+                        _embedding_to_pgvector(_embed(search_document)),
                     ),
                 )
         restaurant = self.get_restaurant(restaurant_id)
@@ -1188,6 +1327,21 @@ class PgRestaurantStore(SqliteRestaurantStore):
             return None
         note_id = str(uuid4())
         note_tags = sorted(set(payload.tags + restaurant.mood_tags + [restaurant.area, restaurant.cuisine, restaurant.price_level]))
+        search_document = _build_restaurant_search_document(
+            name=restaurant.name,
+            area=restaurant.area,
+            city=restaurant.city,
+            district=restaurant.district,
+            town=restaurant.town,
+            cuisine=restaurant.cuisine,
+            price_level=restaurant.price_level,
+            mood_tags=restaurant.mood_tags,
+            signature_menus=restaurant.signature_menus,
+            address=restaurant.address,
+            road_address=restaurant.road_address,
+            note_content=payload.content,
+            note_tags=note_tags,
+        )
         with self._connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -1201,10 +1355,39 @@ class PgRestaurantStore(SqliteRestaurantStore):
                         restaurant_id,
                         payload.content,
                         json.dumps(note_tags, ensure_ascii=False),
-                        _embedding_to_pgvector(_embed(payload.content)),
+                        _embedding_to_pgvector(_embed(search_document)),
                     ),
                 )
         return self.get_restaurant(restaurant_id)
+
+    def rebuild_search_embeddings(self, restaurant_id: str | None = None) -> int:
+        where_clause = "WHERE restaurants.id = %s" if restaurant_id else ""
+        params: tuple[Any, ...] = (restaurant_id,) if restaurant_id else ()
+        with self._connect() as connection:
+            with connection.cursor(row_factory=self.dict_row) as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT restaurants.*, restaurant_notes.id AS note_id,
+                        restaurant_notes.content, restaurant_notes.tags_json
+                    FROM restaurant_notes
+                    JOIN restaurants ON restaurants.id = restaurant_notes.restaurant_id
+                    {where_clause}
+                    """,
+                    params,
+                )
+                rows = list(cursor.fetchall())
+                for row in rows:
+                    search_document = _build_restaurant_search_document_from_row(
+                        row,
+                        row["content"],
+                        _json_list(row["tags_json"]),
+                    )
+                    cursor.execute(
+                        "UPDATE restaurant_notes SET embedding = %s::vector WHERE id = %s",
+                        (_embedding_to_pgvector(_embed(search_document)), row["note_id"]),
+                    )
+            connection.commit()
+        return len(rows)
 
     def create_user(
         self,
@@ -1481,6 +1664,8 @@ class PgRestaurantStore(SqliteRestaurantStore):
                 )
                 updated = cursor.rowcount > 0
             connection.commit()
+        if updated:
+            self.rebuild_search_embeddings(restaurant_id)
         return self.get_restaurant(restaurant_id) if updated else None
 
     def delete_restaurant(self, restaurant_id: str) -> bool:
@@ -1880,6 +2065,9 @@ class RestaurantRepository:
 
     def add_note(self, restaurant_id: str, payload: RestaurantNoteCreate) -> RestaurantResponse | None:
         return self.backend.add_note(restaurant_id, payload)
+
+    def rebuild_search_embeddings(self, restaurant_id: str | None = None) -> int:
+        return self.backend.rebuild_search_embeddings(restaurant_id)
 
     def create_user(
         self,

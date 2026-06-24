@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 TextFilter = str | list[str] | None
 
@@ -87,7 +87,7 @@ class RestaurantCreate(BaseModel):
     town: str | None = None
     cuisine: str = Field(min_length=1, max_length=80)
     price_level: str = "1~2만원"
-    mood_tags: list[str] = []
+    mood_tags: list[str] = Field(min_length=3)
     signature_menus: list[str] = []
     note: str = Field(min_length=10)
     kakao_place_id: str | None = None
@@ -98,6 +98,15 @@ class RestaurantCreate(BaseModel):
     latitude: float | None = None
     longitude: float | None = None
 
+    @field_validator("mood_tags")
+    @classmethod
+    def validate_mood_tags(cls, value: list[str]) -> list[str]:
+        tags = [tag.strip().lstrip("#") for tag in value if tag.strip().lstrip("#")]
+        unique_tags = list(dict.fromkeys(tags))
+        if len(unique_tags) < 3:
+            raise ValueError("태그는 3개 이상 입력해야 합니다.")
+        return unique_tags
+
 
 class RestaurantUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
@@ -107,7 +116,7 @@ class RestaurantUpdate(BaseModel):
     town: str | None = None
     cuisine: str = Field(min_length=1, max_length=80)
     price_level: str
-    mood_tags: list[str] = []
+    mood_tags: list[str] = Field(min_length=3)
     kakao_place_id: str | None = None
     kakao_place_url: str | None = None
     address: str | None = None
@@ -115,6 +124,15 @@ class RestaurantUpdate(BaseModel):
     phone: str | None = None
     latitude: float | None = None
     longitude: float | None = None
+
+    @field_validator("mood_tags")
+    @classmethod
+    def validate_mood_tags(cls, value: list[str]) -> list[str]:
+        tags = [tag.strip().lstrip("#") for tag in value if tag.strip().lstrip("#")]
+        unique_tags = list(dict.fromkeys(tags))
+        if len(unique_tags) < 3:
+            raise ValueError("태그는 3개 이상 입력해야 합니다.")
+        return unique_tags
 
 
 class RestaurantNoteCreate(BaseModel):

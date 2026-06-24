@@ -827,23 +827,23 @@ def _ensure_minimum_recommendations(
 def _build_answer(query: str, recommendations, fallback: bool = False) -> str:
     if not recommendations:
         return (
-            "저장된 맛집 메모에서 조건에 맞는 후보를 찾지 못했어요. "
-            "지역, 음식 종류, 분위기 메모를 먼저 등록하면 더 정확하게 추천할 수 있습니다."
+            "저장된 맛집 리뷰에서 조건에 맞는 후보를 찾지 못했어요. "
+            "지역, 음식 종류, 태그와 리뷰를 먼저 등록하면 더 정확하게 추천할 수 있습니다."
         )
 
     lines = [
         (
             f"아직 저장된 맛집이 없어서 '{query}' 기준으로 바로 가기 좋은 후보를 3순위로 골랐어요."
             if fallback
-            else f"'{query}' 기준으로 저장된 메모와 벡터 검색 결과를 함께 보고 3순위로 추천했어요."
+            else f"'{query}' 기준으로 저장된 리뷰와 벡터 검색 결과를 함께 보고 3순위로 추천했어요."
         ),
         "",
     ]
     for index, recommendation in enumerate(recommendations, start=1):
         restaurant = recommendation.restaurant
         is_external_candidate = restaurant.id.startswith("kakao-") or restaurant.note_count == 0
-        evidence = recommendation.evidence[0] if recommendation.evidence else "저장된 메모가 이 조건과 유사합니다."
-        evidence_label = "장소 특징" if is_external_candidate else "근거 메모"
+        evidence = recommendation.evidence[0] if recommendation.evidence else "저장된 리뷰가 이 조건과 유사합니다."
+        evidence_label = "장소 특징" if is_external_candidate else "근거 리뷰"
         lines.extend(
             [
                 f"{index}. {restaurant.name}",
@@ -1239,7 +1239,7 @@ def _build_fallback_recommendations(query: str, limit: int) -> list[RestaurantRe
             "mood_tags": ["혼밥", "친구", "깔끔함"],
             "signature_menus": ["정식", "국밥"],
             "reason": "메뉴 호불호가 적고 혼밥부터 가벼운 약속까지 커버하기 좋아 2순위로 추천합니다.",
-            "evidence": "저장된 메모 대신 폭넓게 먹기 좋은 메뉴와 편한 분위기를 우선했습니다.",
+            "evidence": "저장된 리뷰 대신 폭넓게 먹기 좋은 메뉴와 편한 분위기를 우선했습니다.",
             "caution": "점심 피크 시간 웨이팅 여부를 지도 앱에서 확인하면 좋아요.",
         },
         {
@@ -1252,7 +1252,7 @@ def _build_fallback_recommendations(query: str, limit: int) -> list[RestaurantRe
             "signature_menus": ["쌀국수", "볶음밥"],
             "reason": "분위기는 가볍고 메뉴 선택지는 넓어서 즉흥 약속용 3순위 후보로 좋습니다.",
             "evidence": "저장 데이터가 쌓이기 전까지는 지역성, 메뉴 다양성, 무난함을 기준으로 추천합니다.",
-            "caution": "취향 메모를 저장하면 다음 추천부터 실제 저장한 장소 중심으로 바뀝니다.",
+            "caution": "취향 리뷰를 저장하면 다음 추천부터 실제 저장한 장소 중심으로 바뀝니다.",
         },
     ]
     recommendations = []

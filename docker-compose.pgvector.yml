@@ -30,6 +30,8 @@ services:
       context: .
     container_name: nyambot-chat-message-worker
     command: ["python", "-m", "app.workers.chat_message_worker"]
+    healthcheck:
+      disable: true
     env_file:
       - .env.dev
     environment:
